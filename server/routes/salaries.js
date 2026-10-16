@@ -103,8 +103,8 @@ function buildFilters(req) {
   // Only the rows where the hiring company actually kept something.
   if (f.withheld === 'true') clauses.push('sa.invoice_amount_cents > sa.credited_amount_cents');
   if (f.search) {
-    clauses.push('(j.title LIKE $f_q OR j.client_name LIKE $f_q OR sa.reference LIKE $f_q'
-      + ' OR j.reference LIKE $f_q)');
+    clauses.push('(j.title ILIKE $f_q OR j.client_name ILIKE $f_q OR sa.reference ILIKE $f_q'
+      + ' OR j.reference ILIKE $f_q)');
     params.f_q = `%${String(f.search).replace(/[%_]/g, '')}%`;
   }
   return { clauses, params, empty: false };
@@ -117,7 +117,7 @@ const EMPTY_TOTALS = {
   tax_hold_cents: 0, to_ssn_cents: 0,
 };
 
-router.get('/', requirePermission('salaries.view'), handler((req, res) => {
+router.get('/', requirePermission('salaries.view'), handler(async (req, res) => {
   const { clauses, params, empty } = buildFilters(req);
   const page = pagination(req);
   const sort = sorting(req, SORTABLE, 'accounting_month');
@@ -127,21 +127,21 @@ router.get('/', requirePermission('salaries.view'), handler((req, res) => {
   }
 
   const where = whereSql(clauses);
-  const total = Number(queryOne(`SELECT COUNT(*) AS n ${JOINS} ${where}`, params).n);
-  const rows = query(
+  const total = Number((await queryOne(`SELECT COUNT(*) AS n ${JOINS} ${where}`, params)).n);
+  const rows = (await query(
     `${SELECT} ${where} ORDER BY ${sort.sql}, sa.id DESC LIMIT $limit OFFSET $offset`,
     { ...params, limit: page.limit, offset: page.offset }
-  ).map(present);
+  )).map(present);
 
   /*
    * Totals cover the whole filtered set, not just this page. Each row's hold
    * is truncated on its own before summing -- the same rule the engine uses --
    * so this figure always equals the sum of the per-row amounts.
    */
-  const counted = query(
+  const counted = (await query(
     `SELECT sa.invoice_amount_cents, sa.credited_amount_cents, j.tax_hold_bps
        ${JOINS} ${where ? `${where} AND` : 'WHERE'} sa.status = 'active'`, params
-  ).map(resolveSalary);
+  )).map(resolveSalary);
 
   const totals = counted.reduce((acc, line) => ({
     count: acc.count + 1,
@@ -155,8 +155,8 @@ router.get('/', requirePermission('salaries.view'), handler((req, res) => {
   noStore(res).json({ ...paged(rows, total, page), sort, totals });
 }));
 
-router.get('/:id', requirePermission('salaries.view'), handler((req, res) => {
-  const row = queryOne(`${SELECT} WHERE sa.id = $id`, { id: Number(req.params.id) });
+router.get('/:id', requirePermission('salaries.view'), handler(async (req, res) => {
+  const row = await queryOne(`${SELECT} WHERE sa.id = $id`, { id: Number(req.params.id) });
   if (!row) throw notFound('Salary not found');
   if (!req.actor.allowsScope('org_unit', row.ssn_id)) throw notFound('Salary not found');
   res.json({ salary: present(row) });
@@ -181,8 +181,8 @@ function validateSalary(req, { partial = false } = {}) {
 }
 
 /** The job must exist, be in scope, and still be open to new salaries. */
-function assertJob(req, jobId, { existing = false } = {}) {
-  const job = queryOne(
+async function assertJob(req, jobId, { existing = false } = {}) {
+  const job = await queryOne(
     `SELECT j.*, d.name AS ssn_name FROM jobs j
        JOIN org_units d ON d.id = j.ssn_id WHERE j.id = $id`,
     { id: jobId }
@@ -225,22 +225,23 @@ function assertAmounts(invoice, credited) {
   }
 }
 
-router.post('/', requirePermission('salaries.create'), handler((req, res) => {
+router.post('/', requirePermission('salaries.create'), handler(async (req, res) => {
   const data = validateSalary(req);
-  const job = assertJob(req, data.job_id);
+  const job = await assertJob(req, data.job_id);
   assertAmounts(data.invoice_amount_cents, data.credited_amount_cents);
   assertPeriod(data.pay_period_from, data.pay_period_to);
   const now = nowIso();
 
-  const id = insertWithReference('salaries', 'SAL', data.accounting_month, (reference) => {
-    const result = execute(
+  const id = await insertWithReference('salaries', 'SAL', data.accounting_month, async (reference) => {
+    const result = await execute(
       `INSERT INTO salaries
          (reference, job_id, accounting_month, invoice_amount_cents, credited_amount_cents,
           credit_date, pay_period_from, pay_period_to, status, notes, attachment_id,
           created_by, created_at, updated_by, updated_at)
        VALUES ($reference, $job_id, $accounting_month, $invoice, $credited,
                $credit_date, $period_from, $period_to, $status, $notes, $attachment_id,
-               $actor, $now, $actor, $now)`,
+               $actor, $now, $actor, $now)
+       RETURNING id`,
       {
         reference,
         job_id: data.job_id,
@@ -262,7 +263,7 @@ router.post('/', requirePermission('salaries.create'), handler((req, res) => {
 
   const { base: hold } = applyBps(data.credited_amount_cents, job.tax_hold_bps);
 
-  audit(req, 'salary', id, 'created', {
+  await audit(req, 'salary', id, 'created', {
     job_id: { from: null, to: data.job_id },
     accounting_month: { from: null, to: data.accounting_month },
     invoice_amount_cents: { from: null, to: data.invoice_amount_cents },
@@ -270,7 +271,7 @@ router.post('/', requirePermission('salaries.create'), handler((req, res) => {
   });
 
   res.status(201).json({
-    salary: present(queryOne(`${SELECT} WHERE sa.id = $id`, { id })),
+    salary: present(await queryOne(`${SELECT} WHERE sa.id = $id`, { id })),
     // What this salary did, spelled out, so the caller need not recompute it.
     effect: {
       withheld_cents: data.invoice_amount_cents - data.credited_amount_cents,
@@ -286,13 +287,13 @@ const TRACKED = [
   'credit_date', 'pay_period_from', 'pay_period_to', 'status', 'notes', 'attachment_id',
 ];
 
-router.put('/:id', requirePermission('salaries.edit'), handler((req, res) => {
-  const existing = queryOne('SELECT * FROM salaries WHERE id = $id', { id: Number(req.params.id) });
+router.put('/:id', requirePermission('salaries.edit'), handler(async (req, res) => {
+  const existing = await queryOne('SELECT * FROM salaries WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('Salary not found');
-  assertJob(req, existing.job_id, { existing: true });
+  await assertJob(req, existing.job_id, { existing: true });
 
   const data = validateSalary(req, { partial: true });
-  if (data.job_id && data.job_id !== existing.job_id) assertJob(req, data.job_id);
+  if (data.job_id && data.job_id !== existing.job_id) await assertJob(req, data.job_id);
 
   const next = {
     job_id: data.job_id ?? existing.job_id,
@@ -309,7 +310,7 @@ router.put('/:id', requirePermission('salaries.edit'), handler((req, res) => {
   assertAmounts(next.invoice_amount_cents, next.credited_amount_cents);
   assertPeriod(next.pay_period_from, next.pay_period_to);
 
-  execute(
+  await execute(
     `UPDATE salaries
         SET job_id = $job_id, accounting_month = $accounting_month,
             invoice_amount_cents = $invoice_amount_cents,
@@ -322,23 +323,23 @@ router.put('/:id', requirePermission('salaries.edit'), handler((req, res) => {
   );
 
   const changes = diff(existing, next, TRACKED);
-  if (Object.keys(changes).length) audit(req, 'salary', existing.id, 'updated', changes);
+  if (Object.keys(changes).length) await audit(req, 'salary', existing.id, 'updated', changes);
 
-  res.json({ salary: present(queryOne(`${SELECT} WHERE sa.id = $id`, { id: existing.id })) });
+  res.json({ salary: present(await queryOne(`${SELECT} WHERE sa.id = $id`, { id: existing.id })) });
 }));
 
-router.delete('/:id', requirePermission('salaries.delete'), handler((req, res) => {
-  assertDeletionAllowed();
-  const existing = queryOne('SELECT * FROM salaries WHERE id = $id', { id: Number(req.params.id) });
+router.delete('/:id', requirePermission('salaries.delete'), handler(async (req, res) => {
+  await assertDeletionAllowed();
+  const existing = await queryOne('SELECT * FROM salaries WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('Salary not found');
-  assertJob(req, existing.job_id, { existing: true });
+  await assertJob(req, existing.job_id, { existing: true });
 
   const reason = String(req.body?.reason ?? '').trim();
   if (!reason) throw badRequest('A reason is required to delete a salary');
 
-  execute('DELETE FROM salaries WHERE id = $id', { id: existing.id });
+  await execute('DELETE FROM salaries WHERE id = $id', { id: existing.id });
 
-  audit(req, 'salary', existing.id, 'deleted', {
+  await audit(req, 'salary', existing.id, 'deleted', {
     reference: { from: existing.reference, to: null },
     credited_amount_cents: { from: existing.credited_amount_cents, to: null },
     accounting_month: { from: existing.accounting_month, to: null },

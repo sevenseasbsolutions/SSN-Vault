@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { query, queryOne, execute, transaction, isUniqueViolation } from '../db/connection.js';
+import { mapSeries } from '../lib/async.js';
 import { handler, noStore } from '../lib/http.js';
 import { check } from '../lib/validate.js';
 import { notFound, conflict, badRequest, forbidden, validationError } from '../lib/errors.js';
@@ -28,38 +29,38 @@ function assertNotSelf(req, targetId, what) {
   }
 }
 
-const shape = (user) => ({
+const shape = async (user) => ({
   ...user,
   password_hash: undefined,
-  effective_permissions: [...resolvePermissions(user)].sort(),
-  scopes: resolveScopes(user),
-  grants: query(
+  effective_permissions: [...(await resolvePermissions(user))].sort(),
+  scopes: await resolveScopes(user),
+  grants: await query(
     'SELECT permission, effect FROM user_permissions WHERE user_id = $id ORDER BY permission',
     { id: user.id }),
 });
 
-router.get('/', handler((req, res) => {
-  const rows = query(
+router.get('/', handler(async (req, res) => {
+  const rows = await mapSeries(await query(
     `SELECT u.*, c.name AS created_by_name FROM users u
      LEFT JOIN users c ON c.id = u.created_by ORDER BY u.is_active DESC, u.name`
-  ).map(shape);
+  ), shape);
   noStore(res).json({ rows, roles: ROLES, role_defaults: ROLE_DEFAULTS, permissions: ALL_PERMISSIONS });
 }));
 
-router.get('/:id', handler((req, res) => {
-  const user = queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
+router.get('/:id', handler(async (req, res) => {
+  const user = await queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
   if (!user) throw notFound('User not found');
   noStore(res).json({
-    user: shape(user),
-    sessions: query(
+    user: await shape(user),
+    sessions: await query(
       `SELECT id, ip, user_agent, created_at, expires_at, revoked_at FROM sessions
        WHERE user_id = $id ORDER BY created_at DESC LIMIT 20`, { id: user.id }),
-    activity: query(
+    activity: await query(
       'SELECT * FROM audit_log WHERE user_id = $id ORDER BY id DESC LIMIT 50', { id: user.id }),
   });
 }));
 
-router.post('/', handler((req, res) => {
+router.post('/', handler(async (req, res) => {
   const data = check(req.body)
     .string('name', { required: true, max: 160, label: 'Name' })
     .email('email', { required: true, label: 'Email' })
@@ -74,24 +75,25 @@ router.post('/', handler((req, res) => {
   if (data.password && weakness) throw badRequest(weakness);
 
   const grants = validateGrants(req, data.permissions ?? [], data.role);
-  const scopes = validateScopes(data.scopes ?? []);
+  const scopes = await validateScopes(data.scopes ?? []);
   const now = nowIso();
 
   let id;
   try {
-    id = transaction(() => {
-      const result = execute(
+    id = await transaction(async () => {
+      const result = await execute(
         `INSERT INTO users (email, name, password_hash, role, is_active, must_change_pw,
            created_by, created_at, updated_by, updated_at)
-         VALUES ($email, $name, $hash, $role, 1, $must_change, $actor, $now, $actor, $now)`,
+         VALUES ($email, $name, $hash, $role, 1, $must_change, $actor, $now, $actor, $now)
+         RETURNING id`,
         {
           email: data.email, name: data.name, hash: hashPassword(password), role: data.role,
           must_change: data.password ? 0 : 1, actor: req.user.id, now,
         }
       );
       const userId = Number(result.lastInsertRowid);
-      writeGrants(userId, grants, req.user.id, now);
-      writeScopes(userId, scopes, req.user.id, now);
+      await writeGrants(userId, grants, req.user.id, now);
+      await writeScopes(userId, scopes, req.user.id, now);
       return userId;
     });
   } catch (err) {
@@ -99,7 +101,7 @@ router.post('/', handler((req, res) => {
     throw err;
   }
 
-  audit(req, 'user', id, 'created', {
+  await audit(req, 'user', id, 'created', {
     email: { from: null, to: data.email },
     role: { from: null, to: data.role },
     permissions: { from: null, to: grants.map((g) => `${g.effect}:${g.permission}`).join(', ') || 'role defaults' },
@@ -107,7 +109,7 @@ router.post('/', handler((req, res) => {
   });
 
   res.status(201).json({
-    user: shape(queryOne('SELECT * FROM users WHERE id = $id', { id })),
+    user: await shape(await queryOne('SELECT * FROM users WHERE id = $id', { id })),
     // Shown once so the owner can hand it over; it is never stored in cleartext.
     temporary_password: data.password ? undefined : password,
   });
@@ -142,13 +144,13 @@ function validateGrants(req, permissions, role) {
  * revisited when MBS1 opens a new SSN.
  */
 function validateScopes(scopes) {
-  return scopes.map((scope) => {
+  return mapSeries(scopes, async (scope) => {
     const type = scope?.scope_type;
     const id = Number(scope?.scope_id);
     if (!SCOPE_TYPES.includes(type) || !Number.isInteger(id)) {
       throw validationError({ scopes: 'Each scope needs a valid scope_type and scope_id' });
     }
-    const unit = queryOne('SELECT id, kind FROM org_units WHERE id = $id', { id });
+    const unit = await queryOne('SELECT id, kind FROM org_units WHERE id = $id', { id });
     if (!unit) throw validationError({ scopes: `No company or SSN with id ${id}` });
     if (unit.kind === 'main') {
       throw validationError({
@@ -159,10 +161,10 @@ function validateScopes(scopes) {
   });
 }
 
-function writeGrants(userId, grants, actorId, now) {
-  execute('DELETE FROM user_permissions WHERE user_id = $id', { id: userId });
+async function writeGrants(userId, grants, actorId, now) {
+  await execute('DELETE FROM user_permissions WHERE user_id = $id', { id: userId });
   for (const grant of grants) {
-    execute(
+    await execute(
       `INSERT INTO user_permissions (user_id, permission, effect, granted_by, created_at)
        VALUES ($user_id, $permission, $effect, $granted_by, $now)`,
       { user_id: userId, permission: grant.permission, effect: grant.effect, granted_by: actorId, now }
@@ -170,10 +172,10 @@ function writeGrants(userId, grants, actorId, now) {
   }
 }
 
-function writeScopes(userId, scopes, actorId, now) {
-  execute('DELETE FROM user_scopes WHERE user_id = $id', { id: userId });
+async function writeScopes(userId, scopes, actorId, now) {
+  await execute('DELETE FROM user_scopes WHERE user_id = $id', { id: userId });
   for (const scope of scopes) {
-    execute(
+    await execute(
       `INSERT INTO user_scopes (user_id, scope_type, scope_id, created_by, created_at)
        VALUES ($user_id, $scope_type, $scope_id, $created_by, $now)`,
       { user_id: userId, scope_type: scope.scope_type, scope_id: scope.scope_id, created_by: actorId, now }
@@ -181,8 +183,8 @@ function writeScopes(userId, scopes, actorId, now) {
   }
 }
 
-router.put('/:id', handler((req, res) => {
-  const existing = queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
+router.put('/:id', handler(async (req, res) => {
+  const existing = await queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('User not found');
 
   const data = check(req.body)
@@ -206,14 +208,14 @@ router.put('/:id', handler((req, res) => {
 
   // The last active owner cannot be demoted or deactivated.
   if (existing.role === 'owner' && (merged.role !== 'owner' || !merged.is_active)) {
-    const owners = Number(queryOne(
+    const owners = Number((await queryOne(
       "SELECT COUNT(*) AS n FROM users WHERE role = 'owner' AND is_active = 1 AND id <> $id",
-      { id: existing.id }).n);
+      { id: existing.id })).n);
     if (owners === 0) throw conflict('There must always be at least one active owner account');
   }
 
   try {
-    execute(
+    await execute(
       `UPDATE users SET name = $name, email = $email, role = $role, is_active = $is_active,
          updated_by = $actor, updated_at = $now WHERE id = $id`,
       { id: existing.id, ...merged, actor: req.user.id, now: nowIso() }
@@ -223,16 +225,16 @@ router.put('/:id', handler((req, res) => {
     throw err;
   }
 
-  if (!merged.is_active || merged.role !== existing.role) revokeAllSessionsForUser(existing.id);
+  if (!merged.is_active || merged.role !== existing.role) await revokeAllSessionsForUser(existing.id);
 
-  audit(req, 'user', existing.id, 'updated',
+  await audit(req, 'user', existing.id, 'updated',
     diff(existing, merged, ['name', 'email', 'role', 'is_active']), req.body.reason ?? null);
-  res.json({ user: shape(queryOne('SELECT * FROM users WHERE id = $id', { id: existing.id })) });
+  res.json({ user: await shape(await queryOne('SELECT * FROM users WHERE id = $id', { id: existing.id })) });
 }));
 
 /** Permissions and scopes are changed through their own guarded endpoint. */
-router.put('/:id/access', handler((req, res) => {
-  const existing = queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
+router.put('/:id/access', handler(async (req, res) => {
+  const existing = await queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('User not found');
   assertNotSelf(req, existing.id, 'permissions');
 
@@ -242,30 +244,30 @@ router.put('/:id/access', handler((req, res) => {
     .result();
 
   const before = {
-    permissions: [...resolvePermissions(existing)].sort().join(', '),
-    scopes: JSON.stringify(resolveScopes(existing)),
+    permissions: [...(await resolvePermissions(existing))].sort().join(', '),
+    scopes: JSON.stringify(await resolveScopes(existing)),
   };
 
   const grants = validateGrants(req, data.permissions ?? [], existing.role);
-  const scopes = validateScopes(data.scopes ?? []);
+  const scopes = await validateScopes(data.scopes ?? []);
   const now = nowIso();
 
-  transaction(() => {
-    writeGrants(existing.id, grants, req.user.id, now);
-    writeScopes(existing.id, scopes, req.user.id, now);
+  await transaction(async () => {
+    await writeGrants(existing.id, grants, req.user.id, now);
+    await writeScopes(existing.id, scopes, req.user.id, now);
   });
 
-  const fresh = queryOne('SELECT * FROM users WHERE id = $id', { id: existing.id });
+  const fresh = await queryOne('SELECT * FROM users WHERE id = $id', { id: existing.id });
   const after = {
-    permissions: [...resolvePermissions(fresh)].sort().join(', '),
-    scopes: JSON.stringify(resolveScopes(fresh)),
+    permissions: [...(await resolvePermissions(fresh))].sort().join(', '),
+    scopes: JSON.stringify(await resolveScopes(fresh)),
   };
-  audit(req, 'user', existing.id, 'access_changed', diff(before, after), req.body.reason ?? null);
-  res.json({ user: shape(fresh) });
+  await audit(req, 'user', existing.id, 'access_changed', diff(before, after), req.body.reason ?? null);
+  res.json({ user: await shape(fresh) });
 }));
 
-router.post('/:id/reset-password', handler((req, res) => {
-  const existing = queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
+router.post('/:id/reset-password', handler(async (req, res) => {
+  const existing = await queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('User not found');
   const supplied = String(req.body?.password ?? '').trim();
   if (supplied) {
@@ -273,7 +275,7 @@ router.post('/:id/reset-password', handler((req, res) => {
     if (weakness) throw badRequest(weakness);
   }
   const password = supplied || randomToken(12);
-  execute(
+  await execute(
     `UPDATE users SET password_hash = $hash, must_change_pw = $must, failed_logins = 0,
        locked_until = NULL, updated_by = $actor, updated_at = $now WHERE id = $id`,
     {
@@ -281,16 +283,16 @@ router.post('/:id/reset-password', handler((req, res) => {
       actor: req.user.id, now: nowIso(),
     }
   );
-  revokeAllSessionsForUser(existing.id);
-  audit(req, 'user', existing.id, 'password_reset', null, req.body?.reason ?? null);
+  await revokeAllSessionsForUser(existing.id);
+  await audit(req, 'user', existing.id, 'password_reset', null, req.body?.reason ?? null);
   res.json({ ok: true, temporary_password: supplied ? undefined : password });
 }));
 
-router.post('/:id/revoke-sessions', handler((req, res) => {
-  const existing = queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
+router.post('/:id/revoke-sessions', handler(async (req, res) => {
+  const existing = await queryOne('SELECT * FROM users WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('User not found');
-  revokeAllSessionsForUser(existing.id);
-  audit(req, 'user', existing.id, 'sessions_revoked', null);
+  await revokeAllSessionsForUser(existing.id);
+  await audit(req, 'user', existing.id, 'sessions_revoked', null);
   res.json({ ok: true });
 }));
 

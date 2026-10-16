@@ -2,21 +2,22 @@
   "name": "vault-partner-finance",
   "version": "1.0.0",
   "private": true,
-  "description": "Partner Payout, Expense & Profit Distribution Management System",
+  "description": "Vault for SSNs: company, SSN and share management (PostgreSQL)",
   "type": "module",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.9.0"
   },
   "scripts": {
-    "start": "node server/index.js",
-    "dev": "node --watch server/index.js",
-    "migrate": "node server/db/migrate.js",
-    "seed": "node server/db/seed.js",
-    "reset": "node server/db/reset.js",
-    "test": "node --test \"tests/*.test.js\"",
-    "test:system": "node tests/system-test.mjs",
-    "test:watch": "node --test --watch \"tests/*.test.js\"",
-    "seed:clear": "node server/db/seed.js --clear"
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "start:web": "node --env-file-if-exists=.env server/frontend.js",
+    "dev": "node --env-file-if-exists=.env --watch server/index.js",
+    "migrate": "node --env-file-if-exists=.env server/db/migrate.js",
+    "seed": "node --env-file-if-exists=.env server/db/seed.js",
+    "seed:clear": "node --env-file-if-exists=.env server/db/seed.js --clear",
+    "reset": "node --env-file-if-exists=.env server/db/reset.js",
+    "test": "node --env-file-if-exists=.env.test --test \"tests/*.test.js\"",
+    "test:watch": "node --env-file-if-exists=.env.test --test --watch \"tests/*.test.js\"",
+    "test:system": "node tests/system-test.mjs"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.3.0",
@@ -24,6 +25,7 @@
     "chart.js": "^4.5.1",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",
-    "pdfkit": "^0.20.2"
+    "pdfkit": "^0.20.2",
+    "pg": "^8.16.3"
   }
 }

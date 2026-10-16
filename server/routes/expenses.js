@@ -67,8 +67,8 @@ function buildFilters(req) {
   if (f.amount_min) { clauses.push('e.amount_cents >= $f_amin'); params.f_amin = Number(f.amount_min); }
   if (f.amount_max) { clauses.push('e.amount_cents <= $f_amax'); params.f_amax = Number(f.amount_max); }
   if (f.search) {
-    clauses.push('(e.description LIKE $f_q OR e.vendor LIKE $f_q OR e.reference LIKE $f_q'
-      + ' OR e.payment_reference LIKE $f_q)');
+    clauses.push('(e.description ILIKE $f_q OR e.vendor ILIKE $f_q OR e.reference ILIKE $f_q'
+      + ' OR e.payment_reference ILIKE $f_q)');
     params.f_q = `%${String(f.search).replace(/[%_]/g, '')}%`;
   }
   return { clauses, params, empty: false };
@@ -76,7 +76,7 @@ function buildFilters(req) {
 
 const whereSql = (clauses) => (clauses.length ? `WHERE ${clauses.join(' AND ')}` : '');
 
-router.get('/', requirePermission('expenses.view'), handler((req, res) => {
+router.get('/', requirePermission('expenses.view'), handler(async (req, res) => {
   const { clauses, params, empty } = buildFilters(req);
   const page = pagination(req);
   const sort = sorting(req, SORTABLE, 'expense_date');
@@ -93,12 +93,12 @@ router.get('/', requirePermission('expenses.view'), handler((req, res) => {
     JOIN org_units d ON d.id = e.ssn_id
     JOIN org_units s ON s.id = d.parent_id`;
 
-  const total = Number(queryOne(`SELECT COUNT(*) AS n ${joins} ${where}`, params).n);
-  const rows = query(
+  const total = Number((await queryOne(`SELECT COUNT(*) AS n ${joins} ${where}`, params)).n);
+  const rows = await query(
     `${SELECT} ${where} ORDER BY ${sort.sql}, e.id DESC LIMIT $limit OFFSET $offset`,
     { ...params, limit: page.limit, offset: page.offset }
   );
-  const totals = queryOne(
+  const totals = await queryOne(
     `SELECT COALESCE(SUM(e.amount_cents), 0) AS amount_cents, COUNT(*) AS count ${joins}
       ${where ? `${where} AND` : 'WHERE'} e.status = 'approved'`, params);
 
@@ -112,32 +112,33 @@ router.get('/', requirePermission('expenses.view'), handler((req, res) => {
 /* ------------------------------------------------------------ categories -- */
 
 router.get('/meta/categories', requirePermission('expenses.view', 'expenses.create'),
-  handler((req, res) => {
+  handler(async (req, res) => {
     res.json({
-      rows: query(`SELECT id, name, is_active, is_system FROM expense_categories
-                    WHERE is_active = 1 ORDER BY name COLLATE NOCASE`),
+      rows: await query(`SELECT id, name, is_active, is_system FROM expense_categories
+                    WHERE is_active = 1 ORDER BY lower(name), name`),
     });
   }));
 
-router.post('/meta/categories', requirePermission('settings.manage'), handler((req, res) => {
+router.post('/meta/categories', requirePermission('settings.manage'), handler(async (req, res) => {
   const data = check(req.body).string('name', { required: true, min: 2, max: 120, label: 'Name' }).result();
-  const existing = queryOne(
+  const existing = await queryOne(
     'SELECT id FROM expense_categories WHERE lower(name) = lower($name)', { name: data.name });
   if (existing) throw validationError({ name: 'A category with that name already exists' });
 
   const now = nowIso();
-  const result = execute(
+  const result = await execute(
     `INSERT INTO expense_categories (name, is_active, is_system, created_by, created_at, updated_at)
-     VALUES ($name, 1, 0, $actor, $now, $now)`,
+     VALUES ($name, 1, 0, $actor, $now, $now)
+     RETURNING id`,
     { name: data.name, actor: req.user.id, now }
   );
   const id = Number(result.lastInsertRowid);
-  audit(req, 'expense_category', id, 'created', { name: { from: null, to: data.name } });
-  res.status(201).json({ category: queryOne('SELECT * FROM expense_categories WHERE id = $id', { id }) });
+  await audit(req, 'expense_category', id, 'created', { name: { from: null, to: data.name } });
+  res.status(201).json({ category: await queryOne('SELECT * FROM expense_categories WHERE id = $id', { id }) });
 }));
 
-router.get('/:id', requirePermission('expenses.view'), handler((req, res) => {
-  const row = queryOne(`${SELECT} WHERE e.id = $id`, { id: Number(req.params.id) });
+router.get('/:id', requirePermission('expenses.view'), handler(async (req, res) => {
+  const row = await queryOne(`${SELECT} WHERE e.id = $id`, { id: Number(req.params.id) });
   if (!row) throw notFound('Expense not found');
   if (!req.actor.allowsScope('org_unit', row.ssn_id)) throw notFound('Expense not found');
   res.json({ expense: row });
@@ -162,8 +163,8 @@ function validateExpense(req, { partial = false } = {}) {
     .result();
 }
 
-function assertSsn(req, ssnId) {
-  const ssn = queryOne('SELECT * FROM org_units WHERE id = $id', { id: ssnId });
+async function assertSsn(req, ssnId) {
+  const ssn = await queryOne('SELECT * FROM org_units WHERE id = $id', { id: ssnId });
   if (!ssn || ssn.kind !== 'ssn') throw validationError({ ssn_id: 'Choose an SSN' });
   if (!req.actor.allowsScope('org_unit', ssn.id)) {
     throw validationError({ ssn_id: 'You are not authorised to charge this SSN' });
@@ -174,27 +175,28 @@ function assertSsn(req, ssnId) {
   return ssn;
 }
 
-function assertCategory(categoryId) {
-  const category = queryOne('SELECT * FROM expense_categories WHERE id = $id', { id: categoryId });
+async function assertCategory(categoryId) {
+  const category = await queryOne('SELECT * FROM expense_categories WHERE id = $id', { id: categoryId });
   if (!category || !category.is_active) throw validationError({ category_id: 'Select a valid category' });
   return category;
 }
 
-router.post('/', requirePermission('expenses.create'), handler((req, res) => {
+router.post('/', requirePermission('expenses.create'), handler(async (req, res) => {
   const data = validateExpense(req);
-  assertSsn(req, data.ssn_id);
-  assertCategory(data.category_id);
+  await assertSsn(req, data.ssn_id);
+  await assertCategory(data.category_id);
   const now = nowIso();
 
-  const id = insertWithReference('expenses', 'EX', data.accounting_month, (reference) => {
-    const result = execute(
+  const id = await insertWithReference('expenses', 'EX', data.accounting_month, async (reference) => {
+    const result = await execute(
       `INSERT INTO expenses
          (reference, ssn_id, accounting_month, expense_date, amount_cents, category_id,
           description, vendor, payment_method, payment_reference, status, attachment_id,
           created_by, created_at, updated_by, updated_at)
        VALUES ($reference, $ssn_id, $accounting_month, $expense_date, $amount, $category_id,
                $description, $vendor, $method, $payment_reference, $status, $attachment_id,
-               $actor, $now, $actor, $now)`,
+               $actor, $now, $actor, $now)
+       RETURNING id`,
       {
         reference,
         ssn_id: data.ssn_id,
@@ -215,13 +217,13 @@ router.post('/', requirePermission('expenses.create'), handler((req, res) => {
     return Number(result.lastInsertRowid);
   });
 
-  audit(req, 'expense', id, 'created', {
+  await audit(req, 'expense', id, 'created', {
     ssn_id: { from: null, to: data.ssn_id },
     accounting_month: { from: null, to: data.accounting_month },
     amount_cents: { from: null, to: data.amount_cents },
   });
 
-  res.status(201).json({ expense: queryOne(`${SELECT} WHERE e.id = $id`, { id }) });
+  res.status(201).json({ expense: await queryOne(`${SELECT} WHERE e.id = $id`, { id }) });
 }));
 
 const TRACKED = [
@@ -229,14 +231,14 @@ const TRACKED = [
   'description', 'vendor', 'payment_method', 'payment_reference', 'status', 'attachment_id',
 ];
 
-router.put('/:id', requirePermission('expenses.edit'), handler((req, res) => {
-  const existing = queryOne('SELECT * FROM expenses WHERE id = $id', { id: Number(req.params.id) });
+router.put('/:id', requirePermission('expenses.edit'), handler(async (req, res) => {
+  const existing = await queryOne('SELECT * FROM expenses WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('Expense not found');
   if (!req.actor.allowsScope('org_unit', existing.ssn_id)) throw notFound('Expense not found');
 
   const data = validateExpense(req, { partial: true });
-  if (data.ssn_id && data.ssn_id !== existing.ssn_id) assertSsn(req, data.ssn_id);
-  if (data.category_id && data.category_id !== existing.category_id) assertCategory(data.category_id);
+  if (data.ssn_id && data.ssn_id !== existing.ssn_id) await assertSsn(req, data.ssn_id);
+  if (data.category_id && data.category_id !== existing.category_id) await assertCategory(data.category_id);
 
   const next = {
     ssn_id: data.ssn_id ?? existing.ssn_id,
@@ -252,7 +254,7 @@ router.put('/:id', requirePermission('expenses.edit'), handler((req, res) => {
     attachment_id: data.attachment_id ?? existing.attachment_id,
   };
 
-  execute(
+  await execute(
     `UPDATE expenses
         SET ssn_id = $ssn_id, accounting_month = $accounting_month,
             expense_date = $expense_date, amount_cents = $amount_cents,
@@ -265,28 +267,28 @@ router.put('/:id', requirePermission('expenses.edit'), handler((req, res) => {
   );
 
   const changes = diff(existing, next, TRACKED);
-  if (Object.keys(changes).length) audit(req, 'expense', existing.id, 'updated', changes);
+  if (Object.keys(changes).length) await audit(req, 'expense', existing.id, 'updated', changes);
 
-  res.json({ expense: queryOne(`${SELECT} WHERE e.id = $id`, { id: existing.id }) });
+  res.json({ expense: await queryOne(`${SELECT} WHERE e.id = $id`, { id: existing.id }) });
 }));
 
-router.delete('/:id', requirePermission('expenses.delete'), handler((req, res) => {
-  assertDeletionAllowed();
-  const existing = queryOne('SELECT * FROM expenses WHERE id = $id', { id: Number(req.params.id) });
+router.delete('/:id', requirePermission('expenses.delete'), handler(async (req, res) => {
+  await assertDeletionAllowed();
+  const existing = await queryOne('SELECT * FROM expenses WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('Expense not found');
   if (!req.actor.allowsScope('org_unit', existing.ssn_id)) throw notFound('Expense not found');
 
   // Large write-offs need a reason on the record, not just in someone's memory.
-  const threshold = Number(getSetting('require_reason_above_cents') ?? 0);
+  const threshold = Number((await getSetting('require_reason_above_cents')) ?? 0);
   const reason = String(req.body?.reason ?? '').trim();
   if (!reason) throw badRequest('A reason is required to delete an expense');
   if (threshold && existing.amount_cents >= threshold && reason.length < 10) {
     throw badRequest('Give a fuller reason for deleting an expense of this size');
   }
 
-  execute('DELETE FROM expenses WHERE id = $id', { id: existing.id });
+  await execute('DELETE FROM expenses WHERE id = $id', { id: existing.id });
 
-  audit(req, 'expense', existing.id, 'deleted', {
+  await audit(req, 'expense', existing.id, 'deleted', {
     reference: { from: existing.reference, to: null },
     amount_cents: { from: existing.amount_cents, to: null },
   }, reason);

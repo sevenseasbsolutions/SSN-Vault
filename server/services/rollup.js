@@ -65,6 +65,7 @@
 import { query, queryOne } from '../db/connection.js';
 import { applyBps, sum } from '../lib/money.js';
 import { toMonth, monthRange } from '../lib/dates.js';
+import { mapSeries } from '../lib/async.js';
 
 const COUNTED_SALARY_STATUS = 'active';
 const COUNTED_EXPENSE_STATUS = 'approved';
@@ -79,7 +80,7 @@ export const unitById = (id) =>
   queryOne('SELECT * FROM org_units WHERE id = $id', { id: Number(id) });
 
 export const childrenOf = (parentId) =>
-  query(`SELECT * FROM org_units WHERE parent_id = $parent ORDER BY name COLLATE NOCASE`,
+  query(`SELECT * FROM org_units WHERE parent_id = $parent ORDER BY lower(name), name`,
     { parent: Number(parentId) });
 
 /**
@@ -98,7 +99,7 @@ export function orgTree() {
     )
     SELECT o.*, w.depth, w.path
       FROM org_units o JOIN walk w ON w.id = o.id
-     ORDER BY w.path
+     ORDER BY w.path COLLATE "C"
   `);
 }
 
@@ -112,7 +113,7 @@ export function ssnsUnder(unitId) {
     )
     SELECT o.* FROM org_units o JOIN walk w ON w.id = o.id
      WHERE o.kind = 'ssn'
-     ORDER BY o.name COLLATE NOCASE
+     ORDER BY lower(o.name), o.name
   `, { id: Number(unitId) });
 }
 
@@ -177,16 +178,16 @@ const salaryRowsFor = (ssnId, month) => query(
 );
 
 /** The same rows with their derived figures, for a statement to list. */
-export const salaryLinesFor = (ssnId, month) =>
-  salaryRowsFor(ssnId, month).map((row) => ({ ...row, ...resolveSalary(row) }));
+export const salaryLinesFor = async (ssnId, month) =>
+  (await salaryRowsFor(ssnId, month)).map((row) => ({ ...row, ...resolveSalary(row) }));
 
 /* ----------------------------------------------------------- SSN month -- */
 
-const expensesFor = (ssnId, month) => Number(queryOne(
+const expensesFor = async (ssnId, month) => Number((await queryOne(
   `SELECT COALESCE(SUM(amount_cents), 0) AS total
      FROM expenses WHERE ssn_id = $ssn AND accounting_month = $month AND status = $status`,
   { ssn: ssnId, month, status: COUNTED_EXPENSE_STATUS }
-).total);
+)).total);
 
 const overrideFor = (ssnId, month) => queryOne(
   `SELECT * FROM tax_overrides WHERE ssn_id = $ssn AND accounting_month = $month`,
@@ -211,20 +212,20 @@ const overrideFor = (ssnId, month) => queryOne(
  * from taxing net: tax is owed on what was earned, not on what is left after
  * the SSN's own costs.
  */
-export function ssnMonth(ssnInput, monthInput) {
-  const ssn = typeof ssnInput === 'object' ? ssnInput : unitById(ssnInput);
+export async function ssnMonth(ssnInput, monthInput) {
+  const ssn = typeof ssnInput === 'object' ? ssnInput : await unitById(ssnInput);
   const month = toMonth(monthInput);
   if (!ssn || ssn.kind !== 'ssn') throw new Error('ssnMonth requires an SSN');
   if (!month) throw new Error('ssnMonth requires an accounting month');
 
-  const lines = salaryLinesFor(ssn.id, month);
+  const lines = await salaryLinesFor(ssn.id, month);
 
   const invoice_cents = sum(lines.map((l) => l.invoice_cents));
   const credited_cents = sum(lines.map((l) => l.credited_cents));
   const withheld_cents = sum(lines.map((l) => l.withheld_cents));
   const computed_tax_cents = sum(lines.map((l) => l.tax_hold_cents));
 
-  const override = overrideFor(ssn.id, month);
+  const override = await overrideFor(ssn.id, month);
   /*
    * The hold is clamped to what was credited: it can never exceed the money it
    * is held out of. An override replaces the computed total but is clamped the
@@ -236,7 +237,7 @@ export function ssnMonth(ssnInput, monthInput) {
   const tax_basis = override ? 'override' : (credited_cents === 0 ? 'none' : 'per_job');
 
   const salary_cents = credited_cents - tax_hold_cents;
-  const expense_cents = expensesFor(ssn.id, month);
+  const expense_cents = await expensesFor(ssn.id, month);
   const distributable_cents = salary_cents - expense_cents;
   const { keep_cents, upstream_cents } = splitDistributable(distributable_cents, ssn.share_bps);
 
@@ -274,14 +275,15 @@ export function ssnMonth(ssnInput, monthInput) {
  * company's total is built from, and naming it makes the roll-up readable and
  * leaves one obvious place to change if a sub-company ever earns a cut.
  */
-export function subMonth(subInput, monthInput) {
-  const sub = typeof subInput === 'object' ? subInput : unitById(subInput);
+export async function subMonth(subInput, monthInput) {
+  const sub = typeof subInput === 'object' ? subInput : await unitById(subInput);
   const month = toMonth(monthInput);
   if (!sub || sub.kind !== 'sub') throw new Error('subMonth requires a sub-company');
 
-  const ssns = childrenOf(sub.id)
-    .filter((d) => d.kind === 'ssn' && d.is_active)
-    .map((d) => ssnMonth(d, month));
+  const ssns = await mapSeries(
+    (await childrenOf(sub.id)).filter((d) => d.kind === 'ssn' && d.is_active),
+    (d) => ssnMonth(d, month)
+  );
 
   const collected_cents = sum(ssns.map((d) => d.upstream_cents));
 
@@ -314,9 +316,9 @@ export function subMonth(subInput, monthInput) {
  * what every sub-company passed up, which is the sum of what every SSN
  * sent upstream.
  */
-export function mainMonth(monthInput) {
+export async function mainMonth(monthInput) {
   const month = toMonth(monthInput);
-  const main = mainUnit();
+  const main = await mainUnit();
   if (!main) {
     return {
       unit_id: null, unit_name: null, accounting_month: month,
@@ -327,9 +329,10 @@ export function mainMonth(monthInput) {
     };
   }
 
-  const subs = childrenOf(main.id)
-    .filter((u) => u.kind === 'sub' && u.is_active)
-    .map((u) => subMonth(u, month));
+  const subs = await mapSeries(
+    (await childrenOf(main.id)).filter((u) => u.kind === 'sub' && u.is_active),
+    (u) => subMonth(u, month)
+  );
 
   return {
     unit_id: main.id,
@@ -352,21 +355,21 @@ export function mainMonth(monthInput) {
 /* ----------------------------------------------------------- time series -- */
 
 /** The months that actually have activity, newest first. */
-export function activeMonths({ limit = 24 } = {}) {
-  return query(`
+export async function activeMonths({ limit = 24 } = {}) {
+  return (await query(`
     SELECT month FROM (
       SELECT DISTINCT accounting_month AS month FROM salaries WHERE status = $sal_status
       UNION
       SELECT DISTINCT accounting_month AS month FROM expenses WHERE status = $exp_status
-    ) ORDER BY month DESC LIMIT $limit
+    ) AS active ORDER BY month DESC LIMIT $limit
   `, { sal_status: COUNTED_SALARY_STATUS, exp_status: COUNTED_EXPENSE_STATUS, limit }
-  ).map((r) => r.month);
+  )).map((r) => r.month);
 }
 
 /** mainMonth across a list of months, oldest first, for charts and trends. */
 export function monthlyTrend(months) {
-  return [...months].sort().map((month) => {
-    const roll = mainMonth(month);
+  return mapSeries([...months].sort(), async (month) => {
+    const roll = await mainMonth(month);
     return {
       month,
       invoice_cents: roll.invoice_cents,
@@ -387,15 +390,18 @@ export function monthlyTrend(months) {
  * Used by the dashboard table, reports and exports, so they all agree with the
  * SSN statement by construction rather than by coincidence.
  */
-export function allSsnMonths(month) {
+export async function allSsnMonths(month) {
   const resolved = toMonth(month);
-  return query(`
+  const ssns = await query(`
     SELECT d.*, s.name AS sub_name, s.id AS sub_id
       FROM org_units d
       JOIN org_units s ON s.id = d.parent_id
      WHERE d.kind = 'ssn' AND d.is_active = 1
-     ORDER BY s.name COLLATE NOCASE, d.name COLLATE NOCASE
-  `).map((ssn) => ({ ...ssnMonth(ssn, resolved), sub_name: ssn.sub_name, sub_id: ssn.sub_id }));
+     ORDER BY lower(s.name), s.name, lower(d.name), d.name
+  `);
+  return mapSeries(ssns, async (ssn) => ({
+    ...(await ssnMonth(ssn, resolved)), sub_name: ssn.sub_name, sub_id: ssn.sub_id,
+  }));
 }
 
 /* ------------------------------------------------------- ranges and filters -- */
@@ -433,11 +439,11 @@ export function monthsCovered(from, to) {
  * a retainer running all year would read as twelve jobs. One grouped query
  * answers it properly for every SSN at once.
  */
-function distinctJobsBySsn(months) {
+async function distinctJobsBySsn(months) {
   if (!months.length) return new Map();
   const keys = Object.fromEntries(months.map((m, i) => [`m${i}`, m]));
   const placeholders = months.map((_, i) => `$m${i}`).join(',');
-  const rows = query(`
+  const rows = await query(`
     SELECT j.ssn_id, COUNT(DISTINCT j.id) AS n
       FROM salaries s
       JOIN jobs j ON j.id = s.job_id
@@ -455,9 +461,9 @@ function distinctJobsBySsn(months) {
  * month's hold was overridden, `override_months` says how many -- a single
  * `tax_basis` cannot describe a range honestly.
  */
-export function ssnRange(ssnInput, months) {
-  const ssn = typeof ssnInput === 'object' ? ssnInput : unitById(ssnInput);
-  const rows = months.map((month) => ssnMonth(ssn, month));
+export async function ssnRange(ssnInput, months) {
+  const ssn = typeof ssnInput === 'object' ? ssnInput : await unitById(ssnInput);
+  const rows = await mapSeries(months, (month) => ssnMonth(ssn, month));
 
   const totals = {};
   for (const key of SUMMABLE) totals[key] = sum(rows.map((r) => r[key]));
@@ -493,23 +499,23 @@ const aggregate = (rows) => Object.fromEntries(
  * unscoped ones were computed by different code -- the exact situation this
  * module exists to prevent.
  */
-export function rangeSummary({ months, subId = null, ssnId = null, allowed = null } = {}) {
-  const main = mainUnit();
+export async function rangeSummary({ months, subId = null, ssnId = null, allowed = null } = {}) {
+  const main = await mainUnit();
 
-  const ssns = query(`
+  const ssns = (await query(`
     SELECT d.*, s.name AS sub_name, s.id AS sub_id
       FROM org_units d
       JOIN org_units s ON s.id = d.parent_id
      WHERE d.kind = 'ssn' AND d.is_active = 1
-     ORDER BY s.name COLLATE NOCASE, d.name COLLATE NOCASE
-  `).filter((ssn) => (allowed === null || allowed.includes(ssn.id))
+     ORDER BY lower(s.name), s.name, lower(d.name), d.name
+  `)).filter((ssn) => (allowed === null || allowed.includes(ssn.id))
     && (subId === null || Number(ssn.sub_id) === Number(subId))
     && (ssnId === null || Number(ssn.id) === Number(ssnId)));
 
-  const jobCounts = distinctJobsBySsn(months);
+  const jobCounts = await distinctJobsBySsn(months);
 
-  const ssnRows = ssns.map((ssn) => ({
-    ...ssnRange(ssn, months),
+  const ssnRows = await mapSeries(ssns, async (ssn) => ({
+    ...(await ssnRange(ssn, months)),
     sub_name: ssn.sub_name,
     sub_id: ssn.sub_id,
     job_count: jobCounts.get(ssn.id) ?? 0,

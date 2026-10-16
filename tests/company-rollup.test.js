@@ -329,7 +329,7 @@ describe('the roll-up', () => {
     assert.equal(alpha.upstream_cents, cents('350'));
     assert.equal(beta.upstream_cents, cents('480'));
 
-    const sub = rollup.subMonth(world.subId, month);
+    const sub = await rollup.subMonth(world.subId, month);
     assert.equal(sub.collected_cents, cents('830'), '350 + 480');
     assert.equal(sub.kept_cents, 0, 'a sub-company keeps nothing');
     assert.equal(sub.passed_up_cents, sub.collected_cents);
@@ -344,8 +344,8 @@ describe('the roll-up', () => {
     const second = await makeWorld(client, { shareBps: 5000 });
     await addJobWithSalary(client, second, { month, invoice: '1000.00', taxPercent: 0 });
 
-    const main = rollup.mainMonth(month);
-    const expected = rollup.allSsnMonths(month).reduce((acc, d) => acc + d.upstream_cents, 0);
+    const main = await rollup.mainMonth(month);
+    const expected = (await rollup.allSsnMonths(month)).reduce((acc, d) => acc + d.upstream_cents, 0);
 
     assert.equal(main.total_received_cents, expected);
     assert.equal(

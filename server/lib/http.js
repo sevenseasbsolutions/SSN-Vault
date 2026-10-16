@@ -1,8 +1,47 @@
 import { badRequest } from './errors.js';
+import { transaction, snapshot } from '../db/connection.js';
 
-/** Wrap an async handler so a rejected promise reaches the error middleware. */
-export const handler = (fn) => (req, res, next) => {
-  Promise.resolve(fn(req, res, next)).catch(next);
+/*
+ * Run a write handler inside one transaction, and hold its response until the
+ * transaction has committed. A handler that answers "created" and then fails
+ * on its audit row must not leave the client believing the write happened:
+ * the whole request is undone, and only an error goes out.
+ */
+async function inWriteTransaction(fn, req, res, next) {
+  const pending = [];
+  res.json = (body) => { pending.push(['json', body]); return res; };
+  res.send = (body) => { pending.push(['send', body]); return res; };
+  try {
+    await transaction(() => fn(req, res, next));
+  } finally {
+    // Back to the prototype's own methods.
+    delete res.json;
+    delete res.send;
+  }
+  const [first] = pending;
+  if (first) (first[0] === 'json' ? res.json(first[1]) : res.send(first[1]));
+}
+
+/**
+ * Wrap a route handler so a rejected promise reaches the error middleware,
+ * and so it runs against the database the way it was written to.
+ *
+ *   GET / HEAD   one consistent read-only snapshot for the whole request, so
+ *                a report summed over many queries never mixes before and
+ *                after a concurrent write.
+ *   anything     one serialised write transaction, all or nothing.
+ *   else
+ *
+ * `transactional: false` opts out, for a handler whose writes must survive
+ * the error it then throws -- the failed-sign-in counter.
+ */
+export const handler = (fn, { transactional = true } = {}) => (req, res, next) => {
+  const method = req.method.toUpperCase();
+  let work;
+  if (!transactional) work = Promise.resolve().then(() => fn(req, res, next));
+  else if (method === 'GET' || method === 'HEAD') work = snapshot(() => fn(req, res, next));
+  else work = inWriteTransaction(fn, req, res, next);
+  work.catch(next);
 };
 
 export function pagination(req, { defaultLimit = 25, maxLimit = 200 } = {}) {

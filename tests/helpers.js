@@ -1,22 +1,38 @@
 /**
  * Test harness.
  *
- * Every test file gets its own throwaway SQLite database and its own HTTP
- * server on an ephemeral port, so tests never share state. DATABASE_PATH is
- * set before the database module is imported, which is why the server modules
- * are loaded through a dynamic import below.
+ * Every test file gets its own throwaway Postgres schema, in the test
+ * database named by TEST_DATABASE_URL, and its own HTTP server on an
+ * ephemeral port, so tests never share state. The schema is created before
+ * the database module is imported -- which is why the server modules are
+ * loaded through a dynamic import below -- and dropped when the file is done.
+ *
+ * TEST_DATABASE_URL is deliberately its own variable: a test run must never
+ * fall back to the application's real database by accident. `npm test` reads
+ * it from .env.test, which deploy/setup-database.sh writes.
  *
  * Test files should import ONLY from this module, so the ordering guarantee
  * holds.
  */
 
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import crypto from 'node:crypto';
+import pg from 'pg';
 
-const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vault-test-'));
-process.env.DATABASE_PATH = path.join(workDir, 'test.db');
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+if (!TEST_DATABASE_URL) {
+  throw new Error('TEST_DATABASE_URL is not set. Run deploy/setup-database.sh, '
+    + 'which creates the test database and writes .env.test.');
+}
+const SCHEMA = `test_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
+{
+  const admin = new pg.Client({ connectionString: TEST_DATABASE_URL });
+  await admin.connect();
+  await admin.query(`CREATE SCHEMA ${SCHEMA}`);
+  await admin.end();
+}
+for (const key of ['DB_HOST', 'DB_PORT', 'DB_NAME', 'DB_USER', 'DB_PASSWORD']) delete process.env[key];
+process.env.DATABASE_URL = TEST_DATABASE_URL;
+process.env.DATABASE_SCHEMA = SCHEMA;
 process.env.NODE_ENV = 'test';
 process.env.OWNER_EMAIL = 'owner@test.local';
 process.env.OWNER_PASSWORD = 'OwnerPassword-2026!';
@@ -44,9 +60,8 @@ let baseUrl = null;
 /** Boot the database and HTTP server once per test file. */
 export async function boot() {
   if (server) return baseUrl;
-  connection.getDb();
-  migrate({ silent: true });
-  ensureBaseline();
+  await migrate({ silent: true });
+  await ensureBaseline();
   // Quiet logger: an expected 500 in a negative test should not spam output.
   const app = createApp({ logger: { error: () => {} } });
   server = app.listen(0, '127.0.0.1');
@@ -58,8 +73,14 @@ export async function boot() {
 export async function shutdown() {
   if (server) await new Promise((resolve) => server.close(resolve));
   server = null;
-  try { connection.closeDb(); } catch { /* already closed */ }
-  try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  try { await connection.closeDb(); } catch { /* already closed */ }
+  const admin = new pg.Client({ connectionString: TEST_DATABASE_URL });
+  try {
+    await admin.connect();
+    await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
+  } finally {
+    await admin.end().catch(() => {});
+  }
 }
 
 /** A cookie-jar HTTP client that carries the session and CSRF token. */

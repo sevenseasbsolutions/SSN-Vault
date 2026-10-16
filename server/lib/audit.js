@@ -29,8 +29,8 @@ export function diff(before, after, fields) {
   return changes;
 }
 
-export function recordAudit({ entityType, entityId, action, actor, reason, changes, ip }) {
-  execute(
+export async function recordAudit({ entityType, entityId, action, actor, reason, changes, ip }) {
+  await execute(
     `INSERT INTO audit_log (entity_type, entity_id, action, user_id, user_label, reason, changes_json, ip, created_at)
      VALUES ($entity_type, $entity_id, $action, $user_id, $user_label, $reason, $changes_json, $ip, $created_at)`,
     {
@@ -51,7 +51,7 @@ export function recordAudit({ entityType, entityId, action, actor, reason, chang
 export const audit = (req, entityType, entityId, action, changes, reason) =>
   recordAudit({ entityType, entityId, action, actor: req.actor, reason, changes, ip: req.ip });
 
-export function listAudit({ entityType, entityId, userId, action, from, to, limit = 50, offset = 0 }) {
+export async function listAudit({ entityType, entityId, userId, action, from, to, limit = 50, offset = 0 }) {
   const clauses = [];
   const params = {};
   if (entityType) { clauses.push('entity_type = $entity_type'); params.entity_type = entityType; }
@@ -62,11 +62,11 @@ export function listAudit({ entityType, entityId, userId, action, from, to, limi
   if (to) { clauses.push('created_at <= $to'); params.to = `${to}T23:59:59.999Z`; }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-  const total = queryOne(`SELECT COUNT(*) AS n FROM audit_log ${where}`, params).n;
-  const rows = query(
+  const total = (await queryOne(`SELECT COUNT(*) AS n FROM audit_log ${where}`, params)).n;
+  const rows = (await query(
     `SELECT * FROM audit_log ${where} ORDER BY id DESC LIMIT $limit OFFSET $offset`,
     { ...params, limit: Number(limit), offset: Number(offset) }
-  ).map((row) => ({
+  )).map((row) => ({
     ...row,
     changes: row.changes_json ? JSON.parse(row.changes_json) : null,
   }));

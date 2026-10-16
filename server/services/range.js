@@ -25,8 +25,8 @@ import { activeMonths } from './rollup.js';
 const MONTH_PARAMS = ['month', 'month_from', 'month_to'];
 
 /** The outer bounds of everything recorded, for a range left open at one end. */
-function activeSpan() {
-  const months = activeMonths();
+async function activeSpan() {
+  const months = await activeMonths();
   return {
     earliest: months[months.length - 1] ?? currentMonth(),
     latest: months[0] ?? currentMonth(),
@@ -48,7 +48,7 @@ function boundDate(name, raw) {
  * page can label what it is showing with the dates that were actually typed
  * rather than the months they resolved to.
  */
-export function resolveRange(req) {
+export async function resolveRange(req) {
   const given = req.query ?? {};
   const dateFrom = boundDate('date_from', given.date_from);
   const dateTo = boundDate('date_to', given.date_to);
@@ -68,7 +68,7 @@ export function resolveRange(req) {
     if (dateFrom && dateTo && dateFrom > dateTo) {
       throw validationError({ date_from: 'The start date is after the end date' });
     }
-    const span = activeSpan();
+    const span = await activeSpan();
     return {
       basis: 'dates',
       date_from: dateFrom,
@@ -85,11 +85,11 @@ export function resolveRange(req) {
   // Nothing asked for: the newest month with any activity, which is what the
   // pages showed before any filter existed.
   if (!from && !to) {
-    const latest = activeMonths({ limit: 1 })[0] ?? currentMonth();
+    const latest = (await activeMonths({ limit: 1 }))[0] ?? currentMonth();
     return { basis: 'month', date_from: null, date_to: null, from: latest, to: latest };
   }
 
-  const span = activeSpan();
+  const span = await activeSpan();
   return {
     basis: 'month',
     date_from: null,

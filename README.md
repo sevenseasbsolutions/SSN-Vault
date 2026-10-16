@@ -96,13 +96,19 @@ are asserted in `tests/company-rollup.test.js`.
 
 ## Quick start
 
+The data lives in **PostgreSQL**. On a fresh machine, create the role, the
+databases and `.env` once (root, because it talks to Postgres as `postgres`):
+
 ```bash
+sudo deploy/setup-database.sh     # role ssn_vault, databases ssn_vault + ssn_vault_test, .env, .env.test
 npm install
-npm start
+SERVE_FRONTEND=true PORT=4000 npm start   # one process, API + frontend, for local use
 ```
 
-The first run creates `data/vault.db`, applies the migrations, creates an owner
-account and prints a one-time password:
+To install it as a service behind nginx with https, see [Deployment](#deployment).
+
+The first run applies the migrations, creates an owner account and prints a
+one-time password:
 
 ```
 ==================================================================
@@ -163,12 +169,13 @@ npm test
 
 | command | what it does |
 |---|---|
-| `npm start` | run the server |
+| `npm start` | run the API (and the frontend too, unless `SERVE_FRONTEND=false`) |
+| `npm run start:web` | run the frontend on its own (`WEB_PORT`) |
 | `npm run dev` | run with `--watch` |
 | `npm run migrate` | apply pending migrations |
 | `npm run seed` | insert sample data |
 | `npm run seed:clear` | remove sample data, keep the structure |
-| `npm run reset` | **delete the database file** (asks for confirmation) |
+| `npm run reset` | **drop every table** in the database (asks for confirmation) |
 | `npm test` | run the test suite |
 
 ---
@@ -332,32 +339,87 @@ injection.
 
 ## Configuration
 
+All of it lives in `.env` (template: `.env.example`), read by the systemd
+services and by every `npm` script.
+
 | variable | default | meaning |
 |---|---|---|
-| `PORT` | `4000` | listening port |
-| `HOST` | `127.0.0.1` | bind address |
-| `DATABASE_PATH` | `data/vault.db` | SQLite file, or `:memory:` |
+| `DOMAIN` | | public name, used by `deploy/install.sh` |
+| `PORT` | `4000` | API listening port (`4010` in `.env.example`) |
+| `HOST` | `127.0.0.1` | API bind address |
+| `SERVE_FRONTEND` | `true` | `false` when the frontend runs as its own service |
+| `WEB_PORT` / `WEB_HOST` | `4011` / `127.0.0.1` | the frontend service |
+| `DATABASE_URL` | | full Postgres URL; wins over the `DB_*` settings |
+| `DB_HOST` `DB_PORT` `DB_NAME` `DB_USER` `DB_PASSWORD` | `127.0.0.1` `5432` `ssn_vault` `ssn_vault` | Postgres connection |
+| `DB_POOL_MAX` | `20` | connections in the pool |
+| `DB_SSL` | `false` | TLS to a remote Postgres |
 | `OWNER_EMAIL` | `owner@example.com` | first-run owner account |
 | `OWNER_PASSWORD` | generated | first-run password |
 | `SESSION_TTL_HOURS` | `12` | session lifetime |
 | `RATE_LIMIT_PER_MINUTE` | `600` | per-user API rate limit |
 | `COOKIE_SECURE` | off | set with TLS in front |
 | `TRUST_PROXY` | `0` | hops to trust for client IP |
+| `TEST_DATABASE_URL` | | `npm test` only, from `.env.test` |
+
+### The database
+
+PostgreSQL, with the conventions the SQLite version used kept as they were:
+dates are ISO-8601 text, flags are 0/1 integers, money is BIGINT cents. The
+databases are created with the `C.UTF-8` locale so text sorts by code point.
+
+Every request runs in one transaction (`handler()` in `server/lib/http.js`):
+a GET reads one consistent snapshot, so a report summed across many queries
+never mixes before and after a write; anything else is a single write
+transaction under one advisory lock -- writers are serialised, as SQLite
+serialised them -- and its response is held until the commit succeeds.
+
+Tests give each test file its own throwaway schema in `ssn_vault_test`.
 
 ---
 
 ## Deployment
 
-Single Node process, SQLite in WAL mode, no external services. Put TLS in front
-and set `COOKIE_SECURE=true` and `TRUST_PROXY=1`.
+Two services behind nginx, on this server:
 
-Back up `data/vault.db` with SQLite's own backup, not a file copy of a live
-database:
+```
+https://vault.idsservices.us
+  nginx :443 ──/api/──▶ ssn-vault-api   127.0.0.1:4010   Node, PostgreSQL
+              └─ / ───▶ ssn-vault-web   127.0.0.1:4011   static frontend
+```
+
+DNS, at the provider for `idsservices.us`:
+
+| Type | Name | Value | TTL |
+|---|---|---|---|
+| A | `vault` | the server's public IPv4 | 300 |
+
+Then, once (and again after every `git pull`):
 
 ```bash
-node -e "const {DatabaseSync}=require('node:sqlite'); \
-  new DatabaseSync('data/vault.db',{readOnly:true}).exec(\"VACUUM INTO 'backup.db'\")"
+sudo NODE_BIN="$(command -v node)" OWNER_EMAIL=you@example.com deploy/install.sh
 ```
+
+It creates the database if needed, installs dependencies, installs and starts
+both services, gets a Let's Encrypt certificate (webroot, renewed by certbot's
+timer, nginx reloaded on renewal) and switches nginx to https. Each stage is
+checked before the next; a config nginx rejects is rolled back. If DNS does
+not point here yet it stops before certbot and says what record to add.
+
+| file | installed as |
+|---|---|
+| `deploy/ssn-vault-api.service` | `/etc/systemd/system/ssn-vault-api.service` |
+| `deploy/ssn-vault-web.service` | `/etc/systemd/system/ssn-vault-web.service` |
+| `deploy/nginx-ssn-vault-https.conf` | `/etc/nginx/sites-available/ssn-vault` |
+| `deploy/nginx-ssn-vault-app.conf` | `/etc/nginx/snippets/ssn-vault-app.conf` |
+
+Back up with `pg_dump`:
+
+```bash
+set -a; . ./.env; set +a
+PGPASSWORD="$DB_PASSWORD" pg_dump -h 127.0.0.1 -U "$DB_USER" -Fc "$DB_NAME" > vault-$(date +%F).dump
+```
+
+Receipts are files under `uploads/`; back that directory up alongside.
 
 ---
 

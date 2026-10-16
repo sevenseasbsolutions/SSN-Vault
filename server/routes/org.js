@@ -37,8 +37,8 @@ const visible = (req, unit) => req.actor.allowsScope('org_unit', unit.id);
  * A scoped user sees only the units they were granted, but always with their
  * ancestors attached: an SSN is meaningless without the company above it.
  */
-router.get('/', requirePermission('org.view'), handler((req, res) => {
-  const flat = orgTree();
+router.get('/', requirePermission('org.view'), handler(async (req, res) => {
+  const flat = await orgTree();
   const allowed = req.actor.scope('org_unit');
 
   let kept = flat;
@@ -60,12 +60,12 @@ router.get('/', requirePermission('org.view'), handler((req, res) => {
     else roots.push(unit);
   }
 
-  res.json({ rows: kept, tree: roots, main: mainUnit() });
+  res.json({ rows: kept, tree: roots, main: await mainUnit() });
 }));
 
 /** Flat SSN list, for the pickers every form needs. */
 router.get('/meta/ssns', requirePermission('org.view', 'jobs.view', 'expenses.view'),
-  handler((req, res) => {
+  handler(async (req, res) => {
     const clauses = ["d.kind = 'ssn'"];
     const params = {};
     const allowed = req.actor.scope('org_unit');
@@ -77,34 +77,34 @@ router.get('/meta/ssns', requirePermission('org.view', 'jobs.view', 'expenses.vi
     if (req.query.active_only !== 'false') clauses.push('d.is_active = 1');
 
     res.json({
-      rows: query(`
+      rows: await query(`
         SELECT d.id, d.name, d.code, d.share_bps, d.is_active,
                s.id AS sub_id, s.name AS sub_name
           FROM org_units d
           JOIN org_units s ON s.id = d.parent_id
          WHERE ${clauses.join(' AND ')}
-         ORDER BY s.name COLLATE NOCASE, d.name COLLATE NOCASE
+         ORDER BY lower(s.name), s.name, lower(d.name), d.name
       `, params),
     });
   }));
 
 /** Sub-companies, for the SSN form's parent picker. */
-router.get('/meta/sub-companies', requirePermission('org.view'), handler((req, res) => {
+router.get('/meta/sub-companies', requirePermission('org.view'), handler(async (req, res) => {
   res.json({
-    rows: query("SELECT id, name, code, is_active FROM org_units WHERE kind = 'sub' ORDER BY name COLLATE NOCASE"),
+    rows: await query("SELECT id, name, code, is_active FROM org_units WHERE kind = 'sub' ORDER BY lower(name), name"),
   });
 }));
 
-router.get('/:id', requirePermission('org.view'), handler((req, res) => {
-  const unit = unitById(req.params.id);
+router.get('/:id', requirePermission('org.view'), handler(async (req, res) => {
+  const unit = await unitById(req.params.id);
   if (!unit) throw notFound('That part of the company structure was not found');
   if (!visible(req, unit)) throw notFound('That part of the company structure was not found');
 
-  const children = query(
-    'SELECT * FROM org_units WHERE parent_id = $id ORDER BY name COLLATE NOCASE',
+  const children = await query(
+    'SELECT * FROM org_units WHERE parent_id = $id ORDER BY lower(name), name',
     { id: unit.id }
   );
-  const parent = unit.parent_id ? unitById(unit.parent_id) : null;
+  const parent = unit.parent_id ? await unitById(unit.parent_id) : null;
   res.json({ unit, parent, children });
 }));
 
@@ -133,10 +133,10 @@ function validateUnit(req, { partial = false } = {}) {
  * Enforce the shape rules a CHECK constraint cannot see: that there is only
  * ever one main company, and that each kind sits under the right parent.
  */
-function assertShape(kind, parentId, { excludeId = null } = {}) {
+async function assertShape(kind, parentId, { excludeId = null } = {}) {
   if (kind === 'main') {
-    const existing = queryOne(
-      'SELECT id FROM org_units WHERE kind = $kind AND ($exclude IS NULL OR id <> $exclude)',
+    const existing = await queryOne(
+      'SELECT id FROM org_units WHERE kind = $kind AND ($exclude::bigint IS NULL OR id <> $exclude)',
       { kind, exclude: excludeId }
     );
     if (existing) {
@@ -154,7 +154,7 @@ function assertShape(kind, parentId, { excludeId = null } = {}) {
         : 'Choose the sub-company this SSN belongs to',
     });
   }
-  const parent = unitById(parentId);
+  const parent = await unitById(parentId);
   if (!parent) throw validationError({ parent_id: 'That parent does not exist' });
 
   const expected = kind === 'sub' ? 'main' : 'sub';
@@ -184,28 +184,29 @@ function assertSsnFields(kind, { share_bps }) {
   return { share_bps: null };
 }
 
-router.post('/', requirePermission('org.manage'), handler((req, res) => {
+router.post('/', requirePermission('org.manage'), handler(async (req, res) => {
   const data = validateUnit(req);
-  const parentId = assertShape(data.kind, data.parent_id);
+  const parentId = await assertShape(data.kind, data.parent_id);
   const shares = assertSsnFields(data.kind, data);
 
   const now = nowIso();
-  const duplicate = queryOne(
+  const duplicate = await queryOne(
     `SELECT id FROM org_units
       WHERE lower(name) = lower($name)
-        AND ((parent_id IS NULL AND $parent IS NULL) OR parent_id = $parent)`,
+        AND ((parent_id IS NULL AND $parent::bigint IS NULL) OR parent_id = $parent)`,
     { name: data.name, parent: parentId }
   );
   if (duplicate) {
     throw validationError({ name: 'Something with that name already exists at this level' });
   }
 
-  const result = execute(
+  const result = await execute(
     `INSERT INTO org_units
        (name, kind, parent_id, share_bps, code, description, is_active,
         created_by, created_at, updated_by, updated_at)
      VALUES ($name, $kind, $parent, $share, $code, $description, $is_active,
-             $actor, $now, $actor, $now)`,
+             $actor, $now, $actor, $now)
+     RETURNING id`,
     {
       name: data.name,
       kind: data.kind,
@@ -220,20 +221,20 @@ router.post('/', requirePermission('org.manage'), handler((req, res) => {
   );
   const id = Number(result.lastInsertRowid);
 
-  audit(req, 'org_unit', id, 'created', {
+  await audit(req, 'org_unit', id, 'created', {
     name: { from: null, to: data.name },
     kind: { from: null, to: data.kind },
     parent_id: { from: null, to: parentId },
     share_bps: { from: null, to: shares.share_bps },
   });
 
-  res.status(201).json({ unit: unitById(id) });
+  res.status(201).json({ unit: await unitById(id) });
 }));
 
 const TRACKED = ['name', 'share_bps', 'code', 'description', 'is_active'];
 
-router.put('/:id', requirePermission('org.manage'), handler((req, res) => {
-  const existing = unitById(req.params.id);
+router.put('/:id', requirePermission('org.manage'), handler(async (req, res) => {
+  const existing = await unitById(req.params.id);
   if (!existing) throw notFound('That part of the company structure was not found');
 
   const data = validateUnit(req, { partial: true });
@@ -260,10 +261,10 @@ router.put('/:id', requirePermission('org.manage'), handler((req, res) => {
   };
 
   if (next.name.toLowerCase() !== existing.name.toLowerCase()) {
-    const duplicate = queryOne(
+    const duplicate = await queryOne(
       `SELECT id FROM org_units
         WHERE lower(name) = lower($name) AND id <> $id
-          AND ((parent_id IS NULL AND $parent IS NULL) OR parent_id = $parent)`,
+          AND ((parent_id IS NULL AND $parent::bigint IS NULL) OR parent_id = $parent)`,
       { name: next.name, id: existing.id, parent: existing.parent_id }
     );
     if (duplicate) {
@@ -271,7 +272,7 @@ router.put('/:id', requirePermission('org.manage'), handler((req, res) => {
     }
   }
 
-  execute(
+  await execute(
     `UPDATE org_units
         SET name = $name, share_bps = $share, code = $code,
             description = $description, is_active = $is_active,
@@ -290,9 +291,9 @@ router.put('/:id', requirePermission('org.manage'), handler((req, res) => {
   );
 
   const changes = diff(existing, next, TRACKED);
-  if (Object.keys(changes).length) audit(req, 'org_unit', existing.id, 'updated', changes);
+  if (Object.keys(changes).length) await audit(req, 'org_unit', existing.id, 'updated', changes);
 
-  res.json({ unit: unitById(existing.id) });
+  res.json({ unit: await unitById(existing.id) });
 }));
 
 /**
@@ -302,21 +303,21 @@ router.put('/:id', requirePermission('org.manage'), handler((req, res) => {
  * past months must keep reconciling, and dropping the row would orphan every
  * figure that was ever reported from it.
  */
-router.delete('/:id', requirePermission('org.manage'), handler((req, res) => {
-  assertDeletionAllowed();
-  const existing = unitById(req.params.id);
+router.delete('/:id', requirePermission('org.manage'), handler(async (req, res) => {
+  await assertDeletionAllowed();
+  const existing = await unitById(req.params.id);
   if (!existing) throw notFound('That part of the company structure was not found');
 
-  const children = Number(queryOne(
-    'SELECT COUNT(*) AS n FROM org_units WHERE parent_id = $id', { id: existing.id }).n);
+  const children = Number((await queryOne(
+    'SELECT COUNT(*) AS n FROM org_units WHERE parent_id = $id', { id: existing.id })).n);
   if (children > 0) {
     throw conflict(`Remove the ${children} item(s) underneath this one first`);
   }
 
-  const jobs = Number(queryOne(
-    'SELECT COUNT(*) AS n FROM jobs WHERE ssn_id = $id', { id: existing.id }).n);
-  const expenses = Number(queryOne(
-    'SELECT COUNT(*) AS n FROM expenses WHERE ssn_id = $id', { id: existing.id }).n);
+  const jobs = Number((await queryOne(
+    'SELECT COUNT(*) AS n FROM jobs WHERE ssn_id = $id', { id: existing.id })).n);
+  const expenses = Number((await queryOne(
+    'SELECT COUNT(*) AS n FROM expenses WHERE ssn_id = $id', { id: existing.id })).n);
   if (jobs > 0 || expenses > 0) {
     throw conflict(
       `This SSN has ${jobs} job(s) and ${expenses} expense(s) recorded against it. `
@@ -324,12 +325,12 @@ router.delete('/:id', requirePermission('org.manage'), handler((req, res) => {
     );
   }
 
-  transaction(() => {
-    execute('DELETE FROM tax_overrides WHERE ssn_id = $id', { id: existing.id });
-    execute('DELETE FROM org_units WHERE id = $id', { id: existing.id });
+  await transaction(async () => {
+    await execute('DELETE FROM tax_overrides WHERE ssn_id = $id', { id: existing.id });
+    await execute('DELETE FROM org_units WHERE id = $id', { id: existing.id });
   });
 
-  audit(req, 'org_unit', existing.id, 'deleted', {
+  await audit(req, 'org_unit', existing.id, 'deleted', {
     name: { from: existing.name, to: null },
     kind: { from: existing.kind, to: null },
   });
@@ -346,23 +347,23 @@ router.delete('/:id', requirePermission('org.manage'), handler((req, res) => {
  * the computed figures together with the rows they were computed from.
  */
 router.get('/:id/statement', requirePermission('reports.view', 'org.view'),
-  handler((req, res) => {
-    const ssn = unitById(req.params.id);
+  handler(async (req, res) => {
+    const ssn = await unitById(req.params.id);
     if (!ssn || ssn.kind !== 'ssn') throw notFound('SSN not found');
     if (!visible(req, ssn)) throw notFound('SSN not found');
 
     const month = toMonth(req.query.month);
     if (!month) throw validationError({ month: 'Give the accounting month as YYYY-MM' });
 
-    const statement = ssnMonth(ssn, month);
-    const sub = ssn.parent_id ? unitById(ssn.parent_id) : null;
+    const statement = await ssnMonth(ssn, month);
+    const sub = ssn.parent_id ? await unitById(ssn.parent_id) : null;
 
     res.json({
       statement: { ...statement, sub_name: sub?.name ?? null },
       // The salary lines the figures above were summed from, each with its
       // own derived withheld / hold / to-the-SSN amounts.
-      salaries: salaryLinesFor(ssn.id, month),
-      expenses: query(
+      salaries: await salaryLinesFor(ssn.id, month),
+      expenses: await query(
         `SELECT e.id, e.reference, e.expense_date, e.description, e.vendor,
                 e.amount_cents, e.status, c.name AS category_name
            FROM expenses e JOIN expense_categories c ON c.id = e.category_id

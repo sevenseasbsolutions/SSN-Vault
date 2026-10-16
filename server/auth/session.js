@@ -35,13 +35,13 @@ const isSecure = (req) =>
   process.env.COOKIE_SECURE === 'true' ||
   (process.env.NODE_ENV === 'production' && req.protocol === 'https');
 
-export function createSession(req, res, user) {
+export async function createSession(req, res, user) {
   const id = crypto.randomUUID();
   const token = randomToken(32);
   const csrf = randomToken(24);
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
 
-  execute(
+  await execute(
     `INSERT INTO sessions (id, user_id, token_hash, csrf_token, ip, user_agent, created_at, expires_at)
      VALUES ($id, $user_id, $token_hash, $csrf_token, $ip, $user_agent, $created_at, $expires_at)`,
     {
@@ -67,14 +67,14 @@ export function createSession(req, res, user) {
   return { id, csrf, expiresAt };
 }
 
-export function readSession(req) {
+export async function readSession(req) {
   const cookies = parseCookies(req.headers.cookie);
   const raw = cookies[SESSION_COOKIE];
   if (!raw || !raw.includes('.')) return null;
   const idx = raw.indexOf('.');
   const id = raw.slice(0, idx);
   const token = raw.slice(idx + 1);
-  const session = queryOne(
+  const session = await queryOne(
     `SELECT * FROM sessions WHERE id = $id AND revoked_at IS NULL AND expires_at > $now`,
     { id, now: nowIso() }
   );
@@ -85,21 +85,21 @@ export function readSession(req) {
   return session;
 }
 
-export function revokeSession(res, sessionId) {
+export async function revokeSession(res, sessionId) {
   if (sessionId) {
-    execute('UPDATE sessions SET revoked_at = $now WHERE id = $id', { id: sessionId, now: nowIso() });
+    await execute('UPDATE sessions SET revoked_at = $now WHERE id = $id', { id: sessionId, now: nowIso() });
   }
   res.append('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
   res.append('Set-Cookie', `${CSRF_COOKIE}=; Path=/; SameSite=Strict; Max-Age=0`);
 }
 
-export function revokeAllSessionsForUser(userId) {
-  execute('UPDATE sessions SET revoked_at = $now WHERE user_id = $uid AND revoked_at IS NULL',
+export async function revokeAllSessionsForUser(userId) {
+  await execute('UPDATE sessions SET revoked_at = $now WHERE user_id = $uid AND revoked_at IS NULL',
     { uid: userId, now: nowIso() });
 }
 
-export function purgeExpiredSessions() {
-  execute('DELETE FROM sessions WHERE expires_at < $cutoff', {
+export async function purgeExpiredSessions() {
+  await execute('DELETE FROM sessions WHERE expires_at < $cutoff', {
     cutoff: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
   });
 }

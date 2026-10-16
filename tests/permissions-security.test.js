@@ -309,10 +309,10 @@ describe('permissions and security', () => {
     assert.ok(userHistory.body.rows.length > 0, 'granting a permission is audited');
 
     // Every audit row names a real actor; nothing financial happens anonymously.
-    const anonymous = query(
+    const anonymous = (await query(
       'SELECT COUNT(*) AS n FROM audit_log WHERE user_id IS NULL'
       + " AND entity_type IN ('job','salary','expense')"
-    )[0];
+    ))[0];
     assert.equal(Number(anonymous.n), 0, 'no financial audit row is missing its author');
   });
 

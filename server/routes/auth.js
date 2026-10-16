@@ -22,8 +22,9 @@ const loginLimiter = rateLimit({
   message: 'Too many sign-in attempts. Please wait a few minutes and try again.',
 });
 
-const sessionPayload = (user) => {
-  const actor = buildActor(user);
+const sessionPayload = async (user) => {
+  const actor = await buildActor(user);
+  const settings = await loadSettings();
   return {
     user: {
       id: user.id, name: user.name, email: user.email, role: user.role,
@@ -32,19 +33,19 @@ const sessionPayload = (user) => {
     permissions: [...actor.permissions].sort(),
     scopes: actor.scopes,
     settings: {
-      org_name: loadSettings().org_name,
-      currency_symbol: loadSettings().currency_symbol,
-      demo_mode: loadSettings().demo_mode === 'true',
-      allow_delete: loadSettings().allow_delete === 'true',
+      org_name: settings.org_name,
+      currency_symbol: settings.currency_symbol,
+      demo_mode: settings.demo_mode === 'true',
+      allow_delete: settings.allow_delete === 'true',
     },
   };
 };
 
-router.post('/login', loginLimiter, handler((req, res) => {
+router.post('/login', loginLimiter, handler(async (req, res) => {
   const body = check(req.body).email('email', { required: true, label: 'Email' })
     .string('password', { required: true, max: 256, label: 'Password' }).result();
 
-  const user = queryOne('SELECT * FROM users WHERE lower(email) = $email', { email: body.email });
+  const user = await queryOne('SELECT * FROM users WHERE lower(email) = $email', { email: body.email });
   // One generic message, so the response cannot be used to enumerate accounts.
   const generic = unauthorized('Incorrect email or password');
 
@@ -53,47 +54,49 @@ router.post('/login', loginLimiter, handler((req, res) => {
     throw forbidden('This account is temporarily locked after repeated failed sign-in attempts.');
   }
   if (!verifyPassword(body.password, user.password_hash)) {
-    const failed = Number(user.failed_logins) + 1;
-    execute(
-      `UPDATE users SET failed_logins = $failed, locked_until = $locked WHERE id = $id`,
+    // One atomic statement, so two wrong guesses at once still count as two.
+    await execute(
+      `UPDATE users SET failed_logins = failed_logins + 1,
+         locked_until = CASE WHEN failed_logins + 1 >= $max THEN $locked ELSE NULL END
+       WHERE id = $id`,
       {
-        id: user.id, failed,
-        locked: failed >= MAX_FAILED
-          ? new Date(Date.now() + LOCK_MINUTES * 60 * 1000).toISOString() : null,
+        id: user.id, max: MAX_FAILED,
+        locked: new Date(Date.now() + LOCK_MINUTES * 60 * 1000).toISOString(),
       }
     );
     throw generic;
   }
   if (!user.is_active) throw forbidden('This account has been deactivated.');
 
-  touchLogin(user.id);
-  createSession(req, res, user);
-  const fresh = queryOne('SELECT * FROM users WHERE id = $id', { id: user.id });
-  req.actor = buildActor(fresh);
-  audit(req, 'session', user.id, 'login', null);
-  noStore(res).json(sessionPayload(fresh));
-}));
+  await touchLogin(user.id);
+  await createSession(req, res, user);
+  const fresh = await queryOne('SELECT * FROM users WHERE id = $id', { id: user.id });
+  req.actor = await buildActor(fresh);
+  await audit(req, 'session', user.id, 'login', null);
+  noStore(res).json(await sessionPayload(fresh));
+  // Not one transaction: a failed attempt's counter must survive the error it throws.
+}, { transactional: false }));
 
-router.post('/logout', handler((req, res) => {
-  if (req.session) audit(req, 'session', req.user.id, 'logout', null);
-  revokeSession(res, req.session?.id);
+router.post('/logout', handler(async (req, res) => {
+  if (req.session) await audit(req, 'session', req.user.id, 'logout', null);
+  await revokeSession(res, req.session?.id);
   res.json({ ok: true });
 }));
 
-router.get('/session', handler((req, res) => {
+router.get('/session', handler(async (req, res) => {
   if (!req.user) return noStore(res).status(401).json({ error: { code: 'unauthorized', message: 'Not signed in' } });
-  noStore(res).json(sessionPayload(req.user));
+  noStore(res).json(await sessionPayload(req.user));
 }));
 
 router.get('/permissions', requireAuth, handler((req, res) => {
   res.json({ rows: publicPermissionCatalog() });
 }));
 
-router.get('/sessions', requireAuth, handler((req, res) => {
-  res.json({ rows: listSessions(req.user.id), current: req.session?.id });
+router.get('/sessions', requireAuth, handler(async (req, res) => {
+  res.json({ rows: await listSessions(req.user.id), current: req.session?.id });
 }));
 
-router.post('/change-password', requireAuth, handler((req, res) => {
+router.post('/change-password', requireAuth, handler(async (req, res) => {
   const body = check(req.body)
     .string('current_password', { required: true, max: 256, label: 'Current password' })
     .string('new_password', { required: true, max: 256, label: 'New password' }).result();
@@ -107,16 +110,16 @@ router.post('/change-password', requireAuth, handler((req, res) => {
     throw badRequest('The new password must be different from the current one');
   }
 
-  execute(
+  await execute(
     `UPDATE users SET password_hash = $hash, must_change_pw = 0, updated_by = $actor, updated_at = $now
      WHERE id = $id`,
     { id: req.user.id, hash: hashPassword(body.new_password), actor: req.user.id, now: nowIso() }
   );
-  audit(req, 'user', req.user.id, 'password_changed', null);
+  await audit(req, 'user', req.user.id, 'password_changed', null);
   // Every other session for this user is invalidated.
-  revokeAllSessionsForUser(req.user.id);
-  const fresh = queryOne('SELECT * FROM users WHERE id = $id', { id: req.user.id });
-  createSession(req, res, fresh);
+  await revokeAllSessionsForUser(req.user.id);
+  const fresh = await queryOne('SELECT * FROM users WHERE id = $id', { id: req.user.id });
+  await createSession(req, res, fresh);
   res.json({ ok: true });
 }));
 

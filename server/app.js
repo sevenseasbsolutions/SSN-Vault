@@ -1,9 +1,8 @@
 import express from 'express';
-import path from 'node:path';
-import { ROOT } from './db/connection.js';
 import { AppError } from './lib/errors.js';
 import { attachUser, csrfGuard, rateLimit } from './auth/middleware.js';
 import { purgeExpiredSessions } from './auth/session.js';
+import { securityHeaders, mountFrontend } from './web.js';
 
 import authRoutes from './routes/auth.js';
 import usersRoutes from './routes/users.js';
@@ -17,32 +16,15 @@ import reportsRoutes from './routes/reports.js';
 import settingsRoutes, { auditRouter } from './routes/settings.js';
 import attachmentsRoutes from './routes/attachments.js';
 
-export function createApp({ logger = console } = {}) {
+export function createApp({
+  logger = console,
+  serveFrontend = process.env.SERVE_FRONTEND !== 'false',
+} = {}) {
   const app = express();
   app.set('trust proxy', Number(process.env.TRUST_PROXY ?? 0));
   app.disable('x-powered-by');
 
-  // Baseline security headers. The CSP is strict: no inline scripts, no remote
-  // origins, so a stored value can never execute in the admin's browser.
-  app.use((req, res, next) => {
-    res.set('X-Content-Type-Options', 'nosniff');
-    res.set('X-Frame-Options', 'DENY');
-    res.set('Referrer-Policy', 'same-origin');
-    res.set('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
-    res.set('Content-Security-Policy', [
-      "default-src 'self'",
-      "script-src 'self'",
-      "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' data: blob:",
-      "font-src 'self'",
-      "connect-src 'self'",
-      "object-src 'none'",
-      "base-uri 'none'",
-      "form-action 'self'",
-      "frame-ancestors 'none'",
-    ].join('; '));
-    next();
-  });
+  app.use(securityHeaders);
 
   // Attachments read their own raw body; everything else is JSON.
   app.use((req, res, next) => {
@@ -73,27 +55,16 @@ export function createApp({ logger = console } = {}) {
   app.use('/api/audit', auditRouter);
   app.use('/api/attachments', attachmentsRoutes);
 
-  app.use('/vendor', express.static(path.join(ROOT, 'node_modules', 'chart.js', 'dist'), {
-    maxAge: '7d', index: false,
-  }));
-  // Fonts are content-addressed by weight and never change: cache them hard.
-  app.use('/fonts', express.static(path.join(ROOT, 'public', 'fonts'), {
-    maxAge: '365d', immutable: true, index: false,
-  }));
-  // Application code revalidates on every load, so a deployed fix is picked up
-  // immediately instead of being masked by a stale cached module.
-  app.use(express.static(path.join(ROOT, 'public'), {
-    index: 'index.html', maxAge: 0, etag: true, lastModified: true,
-  }));
-
   app.use('/api', (req, res) => {
     res.status(404).json({ error: { code: 'not_found', message: 'Unknown endpoint' } });
   });
 
-  // The SPA owns client-side routing.
-  app.get(/^(?!\/api\/).*/, (req, res) => {
-    res.sendFile(path.join(ROOT, 'public', 'index.html'));
-  });
+  /*
+   * The frontend. Served from here for development and the tests; a
+   * deployment runs it as its own service (server/frontend.js) behind nginx
+   * and sets SERVE_FRONTEND=false so this process answers /api only.
+   */
+  if (serveFrontend) mountFrontend(app);
 
   app.use((err, req, res, next) => {
     if (res.headersSent) return next(err);
@@ -104,6 +75,14 @@ export function createApp({ logger = console } = {}) {
     }
     if (err?.type === 'entity.parse.failed') {
       return res.status(400).json({ error: { code: 'bad_json', message: 'Malformed JSON body' } });
+    }
+    /*
+     * A value Postgres cannot read as the column's type -- an id of "1.5", a
+     * number past BIGINT -- is a bad request, not a server fault. SQLite
+     * simply matched nothing; this keeps such requests out of the 500s.
+     */
+    if (err?.code === '22P02' || err?.code === '22003') {
+      return res.status(400).json({ error: { code: 'bad_request', message: 'A value in the request is not valid' } });
     }
     // Unexpected failures are logged in full but never leaked to the client.
     logger.error?.('Unhandled error', { path: req.path, method: req.method, message: err?.message, stack: err?.stack });
@@ -117,7 +96,7 @@ export function createApp({ logger = console } = {}) {
 
 export function startHousekeeping() {
   const timer = setInterval(() => {
-    try { purgeExpiredSessions(); } catch { /* housekeeping is best-effort */ }
+    purgeExpiredSessions().catch(() => { /* housekeeping is best-effort */ });
   }, 60 * 60 * 1000);
   timer.unref();
   return timer;

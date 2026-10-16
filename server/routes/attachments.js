@@ -59,7 +59,7 @@ router.post('/', requirePermission('attachments.upload'),
     req.on('end', () => { req.rawBody = Buffer.concat(chunks); next(); });
     req.on('error', next);
   },
-  handler((req, res) => {
+  handler(async (req, res) => {
     const declared = String(req.get('content-type') ?? '').split(';')[0].trim();
     const spec = ALLOWED[declared];
     const buffer = req.rawBody ?? Buffer.alloc(0);
@@ -76,24 +76,25 @@ router.post('/', requirePermission('attachments.upload'),
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
     fs.writeFileSync(path.join(UPLOAD_DIR, stored), buffer, { mode: 0o600 });
 
-    const id = Number(execute(
+    const id = Number((await execute(
       `INSERT INTO attachments (filename, stored_name, mime_type, byte_size, checksum, uploaded_by, created_at)
-       VALUES ($filename, $stored, $mime, $size, $checksum, $actor, $now)`,
+       VALUES ($filename, $stored, $mime, $size, $checksum, $actor, $now)
+       RETURNING id`,
       {
         filename: safeName, stored, mime: declared, size: buffer.length,
         checksum: crypto.createHash('sha256').update(buffer).digest('hex'),
         actor: req.user.id, now: nowIso(),
       }
-    ).lastInsertRowid);
+    )).lastInsertRowid);
 
-    audit(req, 'attachment', id, 'uploaded', {
+    await audit(req, 'attachment', id, 'uploaded', {
       filename: { from: null, to: safeName }, byte_size: { from: null, to: buffer.length },
     });
     res.status(201).json({ attachment: { id, filename: safeName, mime_type: declared, byte_size: buffer.length } });
   }));
 
-router.get('/:id', handler((req, res) => {
-  const attachment = queryOne('SELECT * FROM attachments WHERE id = $id', { id: Number(req.params.id) });
+router.get('/:id', handler(async (req, res) => {
+  const attachment = await queryOne('SELECT * FROM attachments WHERE id = $id', { id: Number(req.params.id) });
   if (!attachment) throw notFound('Attachment not found');
 
   /*
@@ -102,9 +103,9 @@ router.get('/:id', handler((req, res) => {
    * general is not enough if this job belongs to an SSN outside the
    * viewer's scope.
    */
-  const job = queryOne(
+  const job = await queryOne(
     'SELECT ssn_id FROM jobs WHERE attachment_id = $id', { id: attachment.id });
-  const expense = job ? null : queryOne(
+  const expense = job ? null : await queryOne(
     'SELECT ssn_id FROM expenses WHERE attachment_id = $id', { id: attachment.id });
 
   if (job) {

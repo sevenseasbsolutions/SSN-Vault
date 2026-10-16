@@ -1,0 +1,28 @@
+# Template. deploy/install.sh fills in @APP_DIR@, @APP_USER@ and @NODE_BIN@ and
+# installs the result as /etc/systemd/system/ssn-vault-api.service.
+[Unit]
+Description=SSN Vault API (Node/Express, behind nginx at /api)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+# Boot migrates the database before listening; retry through a slow Postgres start.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=exec
+User=@APP_USER@
+Group=@APP_USER@
+WorkingDirectory=@APP_DIR@
+EnvironmentFile=@APP_DIR@/.env
+# Localhost only (HOST/PORT in .env); nginx is the sole client.
+ExecStart=@NODE_BIN@ @APP_DIR@/server/index.js
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

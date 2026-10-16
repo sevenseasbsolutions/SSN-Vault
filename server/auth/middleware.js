@@ -5,15 +5,16 @@ import { buildActor } from './permissions.js';
 import { readSession, CSRF_HEADER } from './session.js';
 
 /** Resolves req.session / req.user / req.actor when a valid session exists. */
-export function attachUser(req, res, next) {
+export async function attachUser(req, res, next) {
   try {
-    const session = readSession(req);
+    const session = await readSession(req);
     if (session) {
-      const user = queryOne('SELECT * FROM users WHERE id = $id', { id: session.user_id });
+      const user = await queryOne('SELECT * FROM users WHERE id = $id', { id: session.user_id });
       if (user && user.is_active) {
+        const actor = await buildActor(user);
         req.session = session;
         req.user = user;
-        req.actor = buildActor(user);
+        req.actor = actor;
       }
     }
   } catch { /* an unreadable session is simply an anonymous request */ }
@@ -79,7 +80,7 @@ export function rateLimit({ windowMs = 60_000, max = 120, key = (req) => req.ip,
   };
 }
 
-export function touchLogin(userId) {
-  execute('UPDATE users SET last_login_at = $now, failed_logins = 0, locked_until = NULL WHERE id = $id',
+export async function touchLogin(userId) {
+  await execute('UPDATE users SET last_login_at = $now, failed_logins = 0, locked_until = NULL WHERE id = $id',
     { id: userId, now: nowIso() });
 }

@@ -27,8 +27,8 @@ const EDITABLE = {
   demo_mode: { label: 'Demo banner', type: 'enum', values: ['true', 'false'] },
 };
 
-router.get('/', requireAuth, handler((req, res) => {
-  const all = loadSettings();
+router.get('/', requireAuth, handler(async (req, res) => {
+  const all = await loadSettings();
   const canManage = req.actor.can('settings.manage');
   const visible = canManage ? all : {
     org_name: all.org_name, currency_symbol: all.currency_symbol,
@@ -42,9 +42,9 @@ router.get('/', requireAuth, handler((req, res) => {
   });
 }));
 
-router.put('/', requirePermission('settings.manage'), handler((req, res) => {
+router.put('/', requirePermission('settings.manage'), handler(async (req, res) => {
   const updates = req.body && typeof req.body === 'object' ? req.body : {};
-  const before = loadSettings();
+  const before = await loadSettings();
   const changes = {};
 
   for (const [key, value] of Object.entries(updates)) {
@@ -53,11 +53,11 @@ router.put('/', requirePermission('settings.manage'), handler((req, res) => {
     const next = coerce(key, value, spec);
     if (String(before[key]) !== String(next)) {
       changes[key] = { from: before[key], to: next };
-      setSetting(key, next, req.user.id);
+      await setSetting(key, next, req.user.id);
     }
   }
-  if (Object.keys(changes).length) audit(req, 'settings', null, 'updated', changes);
-  res.json({ settings: loadSettings(), changes });
+  if (Object.keys(changes).length) await audit(req, 'settings', null, 'updated', changes);
+  res.json({ settings: await loadSettings(), changes });
 }));
 
 function coerce(key, value, spec) {
@@ -85,10 +85,10 @@ function coerce(key, value, spec) {
 export const auditRouter = Router();
 auditRouter.use(requireAuth, requirePermission('audit.view'));
 
-auditRouter.get('/', handler((req, res) => {
+auditRouter.get('/', handler(async (req, res) => {
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
   const page = Math.max(1, Number(req.query.page) || 1);
-  const { rows, total } = listAudit({
+  const { rows, total } = await listAudit({
     entityType: req.query.entity_type,
     entityId: req.query.entity_id,
     userId: req.query.user_id,
@@ -100,9 +100,9 @@ auditRouter.get('/', handler((req, res) => {
   });
   noStore(res).json({
     rows, pagination: { total, page, limit, pages: Math.max(1, Math.ceil(total / limit)) },
-    entity_types: query('SELECT DISTINCT entity_type FROM audit_log ORDER BY entity_type')
+    entity_types: (await query('SELECT DISTINCT entity_type FROM audit_log ORDER BY entity_type'))
       .map((r) => r.entity_type),
-    actions: query('SELECT DISTINCT action FROM audit_log ORDER BY action').map((r) => r.action),
+    actions: (await query('SELECT DISTINCT action FROM audit_log ORDER BY action')).map((r) => r.action),
   });
 }));
 

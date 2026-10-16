@@ -83,11 +83,11 @@ export const publicPermissionCatalog = () =>
     owner_only: OWNER_ONLY.has(key),
   }));
 
-export function resolvePermissions(user) {
+export async function resolvePermissions(user) {
   if (!user) return new Set();
   if (!user.is_active) return new Set();
   const base = new Set(ROLE_DEFAULTS[user.role] ?? []);
-  const rows = query(
+  const rows = await query(
     'SELECT permission, effect FROM user_permissions WHERE user_id = $user_id',
     { user_id: user.id }
   );
@@ -114,11 +114,11 @@ export function resolvePermissions(user) {
  * access to MBS1 does not mean listing Alpha, Beta and every SSN added
  * later by hand.
  */
-export function resolveScopes(user) {
+export async function resolveScopes(user) {
   if (!user) return { org_unit: [] };
   if (user.role === 'owner') return { org_unit: null };
 
-  const rows = query(
+  const rows = await query(
     "SELECT scope_id FROM user_scopes WHERE user_id = $user_id AND scope_type = 'org_unit'",
     { user_id: user.id }
   );
@@ -128,21 +128,21 @@ export function resolveScopes(user) {
   const keys = Object.fromEntries(granted.map((id, i) => [`s${i}`, id]));
   const placeholders = granted.map((_, i) => `$s${i}`).join(',');
   // Expand each granted unit to itself plus everything beneath it.
-  const expanded = query(`
+  const expanded = (await query(`
     WITH RECURSIVE walk(id) AS (
       SELECT id FROM org_units WHERE id IN (${placeholders})
       UNION
       SELECT u.id FROM org_units u JOIN walk w ON u.parent_id = w.id
     )
     SELECT id FROM walk
-  `, keys).map((r) => Number(r.id));
+  `, keys)).map((r) => Number(r.id));
 
   return { org_unit: [...new Set([...granted, ...expanded])] };
 }
 
-export function buildActor(user) {
-  const permissions = resolvePermissions(user);
-  const scopes = resolveScopes(user);
+export async function buildActor(user) {
+  const permissions = await resolvePermissions(user);
+  const scopes = await resolveScopes(user);
   return {
     id: user.id,
     name: user.name,

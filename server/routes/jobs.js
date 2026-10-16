@@ -80,7 +80,8 @@ function buildFilters(req) {
   if (f.joined_from) { clauses.push('j.joining_date >= $f_jf'); params.f_jf = String(f.joined_from).slice(0, 10); }
   if (f.joined_to) { clauses.push('j.joining_date <= $f_jt'); params.f_jt = String(f.joined_to).slice(0, 10); }
   if (f.search) {
-    clauses.push('(j.title LIKE $f_q OR j.client_name LIKE $f_q OR j.reference LIKE $f_q)');
+    // ILIKE: SQLite's LIKE was case-insensitive, and searches were written for that.
+    clauses.push('(j.title ILIKE $f_q OR j.client_name ILIKE $f_q OR j.reference ILIKE $f_q)');
     params.f_q = `%${String(f.search).replace(/[%_]/g, '')}%`;
   }
   return { clauses, params, empty: false };
@@ -88,7 +89,7 @@ function buildFilters(req) {
 
 const whereSql = (clauses) => (clauses.length ? `WHERE ${clauses.join(' AND ')}` : '');
 
-router.get('/', requirePermission('jobs.view'), handler((req, res) => {
+router.get('/', requirePermission('jobs.view'), handler(async (req, res) => {
   const { clauses, params, empty } = buildFilters(req);
   const page = pagination(req);
   const sort = sorting(req, SORTABLE, 'joining_date');
@@ -101,13 +102,13 @@ router.get('/', requirePermission('jobs.view'), handler((req, res) => {
   }
 
   const where = whereSql(clauses);
-  const total = Number(queryOne(`SELECT COUNT(*) AS n ${JOINS} ${where}`, params).n);
-  const rows = query(
+  const total = Number((await queryOne(`SELECT COUNT(*) AS n ${JOINS} ${where}`, params)).n);
+  const rows = await query(
     `${SELECT} ${where} ORDER BY ${sort.sql}, j.id DESC LIMIT $limit OFFSET $offset`,
     { ...params, limit: page.limit, offset: page.offset }
   );
 
-  const totals = queryOne(
+  const totals = await queryOne(
     `SELECT COUNT(*) AS jobs,
             COALESCE(SUM(j.is_active), 0) AS active,
             COALESCE(SUM((SELECT COALESCE(SUM(sa.credited_amount_cents), 0) FROM salaries sa
@@ -130,7 +131,7 @@ router.get('/', requirePermission('jobs.view'), handler((req, res) => {
 }));
 
 /** Jobs a salary can be recorded against: active ones only. */
-router.get('/meta/open', requirePermission('jobs.view'), handler((req, res) => {
+router.get('/meta/open', requirePermission('jobs.view'), handler(async (req, res) => {
   const clauses = ['j.is_active = 1'];
   const params = {};
   if (!applyScope(req.actor, 'org_unit', 'j.ssn_id', clauses, params, 'scope')) {
@@ -139,23 +140,23 @@ router.get('/meta/open', requirePermission('jobs.view'), handler((req, res) => {
   if (req.query.ssn_id) { clauses.push('j.ssn_id = $ssn'); params.ssn = Number(req.query.ssn_id); }
 
   res.json({
-    rows: query(`
+    rows: await query(`
       SELECT j.id, j.reference, j.title, j.client_name, j.tax_category, j.tax_hold_bps,
              j.joining_date, d.id AS ssn_id, d.name AS ssn_name, s.name AS sub_name
         ${JOINS}
        WHERE ${clauses.join(' AND ')}
-       ORDER BY s.name COLLATE NOCASE, d.name COLLATE NOCASE, j.title COLLATE NOCASE
+       ORDER BY lower(s.name), s.name, lower(d.name), d.name, lower(j.title), j.title
     `, params),
   });
 }));
 
-router.get('/:id', requirePermission('jobs.view'), handler((req, res) => {
-  const row = queryOne(`${SELECT} WHERE j.id = $id`, { id: Number(req.params.id) });
+router.get('/:id', requirePermission('jobs.view'), handler(async (req, res) => {
+  const row = await queryOne(`${SELECT} WHERE j.id = $id`, { id: Number(req.params.id) });
   if (!row) throw notFound('Job not found');
   if (!req.actor.allowsScope('org_unit', row.ssn_id)) throw notFound('Job not found');
 
   // Its salaries, so the job screen can show what it has actually paid.
-  const salaries = query(
+  const salaries = await query(
     `SELECT id, reference, accounting_month, invoice_amount_cents, credited_amount_cents,
             credit_date, pay_period_from, pay_period_to, status
        FROM salaries WHERE job_id = $id ORDER BY accounting_month DESC, id DESC`,
@@ -185,8 +186,8 @@ function validateJob(req, { partial = false } = {}) {
     .result();
 }
 
-function assertSsn(req, ssnId) {
-  const ssn = queryOne('SELECT * FROM org_units WHERE id = $id', { id: ssnId });
+async function assertSsn(req, ssnId) {
+  const ssn = await queryOne('SELECT * FROM org_units WHERE id = $id', { id: ssnId });
   if (!ssn || ssn.kind !== 'ssn') throw validationError({ ssn_id: 'Choose an SSN' });
   if (!req.actor.allowsScope('org_unit', ssn.id)) {
     throw validationError({ ssn_id: 'You are not authorised to record against this SSN' });
@@ -197,20 +198,21 @@ function assertSsn(req, ssnId) {
   return ssn;
 }
 
-router.post('/', requirePermission('jobs.create'), handler((req, res) => {
+router.post('/', requirePermission('jobs.create'), handler(async (req, res) => {
   const data = validateJob(req);
-  assertSsn(req, data.ssn_id);
+  await assertSsn(req, data.ssn_id);
   const now = nowIso();
 
   // A job has no accounting month, so its reference is sequenced by the month
   // the engagement started in.
-  const id = insertWithReference('jobs', 'JOB', toMonth(data.joining_date), (reference) => {
-    const result = execute(
+  const id = await insertWithReference('jobs', 'JOB', toMonth(data.joining_date), async (reference) => {
+    const result = await execute(
       `INSERT INTO jobs
          (reference, ssn_id, title, client_name, tax_category, tax_hold_bps, joining_date,
           is_active, notes, attachment_id, created_by, created_at, updated_by, updated_at)
        VALUES ($reference, $ssn_id, $title, $client, $category, $hold, $joining_date,
-               $is_active, $notes, $attachment_id, $actor, $now, $actor, $now)`,
+               $is_active, $notes, $attachment_id, $actor, $now, $actor, $now)
+       RETURNING id`,
       {
         reference,
         ssn_id: data.ssn_id,
@@ -229,7 +231,7 @@ router.post('/', requirePermission('jobs.create'), handler((req, res) => {
     return Number(result.lastInsertRowid);
   });
 
-  audit(req, 'job', id, 'created', {
+  await audit(req, 'job', id, 'created', {
     ssn_id: { from: null, to: data.ssn_id },
     title: { from: null, to: data.title },
     tax_category: { from: null, to: data.tax_category },
@@ -237,7 +239,7 @@ router.post('/', requirePermission('jobs.create'), handler((req, res) => {
     joining_date: { from: null, to: data.joining_date },
   });
 
-  res.status(201).json({ job: queryOne(`${SELECT} WHERE j.id = $id`, { id }) });
+  res.status(201).json({ job: await queryOne(`${SELECT} WHERE j.id = $id`, { id }) });
 }));
 
 const TRACKED = [
@@ -245,13 +247,13 @@ const TRACKED = [
   'joining_date', 'is_active', 'notes', 'attachment_id',
 ];
 
-router.put('/:id', requirePermission('jobs.edit'), handler((req, res) => {
-  const existing = queryOne('SELECT * FROM jobs WHERE id = $id', { id: Number(req.params.id) });
+router.put('/:id', requirePermission('jobs.edit'), handler(async (req, res) => {
+  const existing = await queryOne('SELECT * FROM jobs WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('Job not found');
   if (!req.actor.allowsScope('org_unit', existing.ssn_id)) throw notFound('Job not found');
 
   const data = validateJob(req, { partial: true });
-  if (data.ssn_id && data.ssn_id !== existing.ssn_id) assertSsn(req, data.ssn_id);
+  if (data.ssn_id && data.ssn_id !== existing.ssn_id) await assertSsn(req, data.ssn_id);
 
   const next = {
     ssn_id: data.ssn_id ?? existing.ssn_id,
@@ -265,7 +267,7 @@ router.put('/:id', requirePermission('jobs.edit'), handler((req, res) => {
     attachment_id: data.attachment_id ?? existing.attachment_id,
   };
 
-  execute(
+  await execute(
     `UPDATE jobs
         SET ssn_id = $ssn_id, title = $title, client_name = $client_name,
             tax_category = $tax_category, tax_hold_bps = $tax_hold_bps,
@@ -276,7 +278,7 @@ router.put('/:id', requirePermission('jobs.edit'), handler((req, res) => {
   );
 
   const changes = diff(existing, next, TRACKED);
-  if (Object.keys(changes).length) audit(req, 'job', existing.id, 'updated', changes);
+  if (Object.keys(changes).length) await audit(req, 'job', existing.id, 'updated', changes);
 
   /*
    * Changing the hold restates every month this job has already paid into,
@@ -284,15 +286,15 @@ router.put('/:id', requirePermission('jobs.edit'), handler((req, res) => {
    * rather than letting a past month's figure move without anyone noticing.
    */
   const restated = changes.tax_hold_bps
-    ? Number(queryOne(
+    ? Number((await queryOne(
       "SELECT COUNT(DISTINCT accounting_month) AS n FROM salaries"
       + " WHERE job_id = $id AND status = 'active'",
       { id: existing.id }
-    ).n)
+    )).n)
     : 0;
 
   res.json({
-    job: queryOne(`${SELECT} WHERE j.id = $id`, { id: existing.id }),
+    job: await queryOne(`${SELECT} WHERE j.id = $id`, { id: existing.id }),
     warnings: restated > 0
       ? [`The tax hold changed, so ${restated} month(s) already recorded against this job `
         + 'have been restated.']
@@ -300,9 +302,9 @@ router.put('/:id', requirePermission('jobs.edit'), handler((req, res) => {
   });
 }));
 
-router.delete('/:id', requirePermission('jobs.delete'), handler((req, res) => {
-  assertDeletionAllowed();
-  const existing = queryOne('SELECT * FROM jobs WHERE id = $id', { id: Number(req.params.id) });
+router.delete('/:id', requirePermission('jobs.delete'), handler(async (req, res) => {
+  await assertDeletionAllowed();
+  const existing = await queryOne('SELECT * FROM jobs WHERE id = $id', { id: Number(req.params.id) });
   if (!existing) throw notFound('Job not found');
   if (!req.actor.allowsScope('org_unit', existing.ssn_id)) throw notFound('Job not found');
 
@@ -310,8 +312,8 @@ router.delete('/:id', requirePermission('jobs.delete'), handler((req, res) => {
   if (!reason) throw badRequest('A reason is required to delete a job');
 
   // A job with salaries behind it cannot go: its months must keep reconciling.
-  const salaries = Number(queryOne(
-    'SELECT COUNT(*) AS n FROM salaries WHERE job_id = $id', { id: existing.id }).n);
+  const salaries = Number((await queryOne(
+    'SELECT COUNT(*) AS n FROM salaries WHERE job_id = $id', { id: existing.id })).n);
   if (salaries > 0) {
     throw conflict(
       `This job has ${salaries} salary record(s) against it. Mark it inactive instead, `
@@ -319,9 +321,9 @@ router.delete('/:id', requirePermission('jobs.delete'), handler((req, res) => {
     );
   }
 
-  execute('DELETE FROM jobs WHERE id = $id', { id: existing.id });
+  await execute('DELETE FROM jobs WHERE id = $id', { id: existing.id });
 
-  audit(req, 'job', existing.id, 'deleted', {
+  await audit(req, 'job', existing.id, 'deleted', {
     reference: { from: existing.reference, to: null },
     title: { from: existing.title, to: null },
   }, reason);

@@ -17,6 +17,7 @@ import { check } from '../lib/validate.js';
 import { notFound, validationError } from '../lib/errors.js';
 import { toMonth, addMonths, currentMonth, monthKey } from '../lib/dates.js';
 import { sum } from '../lib/money.js';
+import { mapSeries } from '../lib/async.js';
 import { toCsv, toXlsx } from '../lib/export.js';
 import { listAudit } from '../lib/audit.js';
 import { statementPdf } from '../lib/pdf.js';
@@ -67,10 +68,11 @@ const totalsOf = (rows) => ({
 
 /* ------------------------------------------------------------ month report -- */
 
-router.get('/month', requirePermission('reports.view'), handler((req, res) => {
-  const month = toMonth(req.query.month) || activeMonths({ limit: 1 })[0] || currentMonth();
+router.get('/month', requirePermission('reports.view'), handler(async (req, res) => {
+  const month = toMonth(req.query.month) || (await activeMonths({ limit: 1 }))[0] || currentMonth();
   const allow = inScope(req.actor);
-  const rows = allSsnMonths(month).filter((r) => allow(r.ssn_id));
+  const rows = (await allSsnMonths(month)).filter((r) => allow(r.ssn_id));
+  const main = await mainUnit();
 
   noStore(res).json({
     basis: {
@@ -79,11 +81,8 @@ router.get('/month', requirePermission('reports.view'), handler((req, res) => {
         + 'not the month it is dated.',
     },
     month,
-    months: activeMonths(),
-    main: (() => {
-      const main = mainUnit();
-      return main ? { id: main.id, name: main.name } : null;
-    })(),
+    months: await activeMonths(),
+    main: main ? { id: main.id, name: main.name } : null,
     rows,
     totals: totalsOf(rows),
     received_by_main_cents: sum(rows.map((r) => r.upstream_cents)),
@@ -98,12 +97,12 @@ router.get('/month', requirePermission('reports.view'), handler((req, res) => {
  * The range is inclusive and capped at 36 months so a mistyped year cannot ask
  * the engine for a thousand statements.
  */
-router.get('/ssn/:id', requirePermission('reports.view'), handler((req, res) => {
-  const ssn = unitById(req.params.id);
+router.get('/ssn/:id', requirePermission('reports.view'), handler(async (req, res) => {
+  const ssn = await unitById(req.params.id);
   if (!ssn || ssn.kind !== 'ssn') throw notFound('SSN not found');
   if (!inScope(req.actor)(ssn.id)) throw notFound('SSN not found');
 
-  const to = toMonth(req.query.month_to) || activeMonths({ limit: 1 })[0] || currentMonth();
+  const to = toMonth(req.query.month_to) || (await activeMonths({ limit: 1 }))[0] || currentMonth();
   const from = toMonth(req.query.month_from) || addMonths(to, -5);
   if (from > to) throw validationError({ month_from: 'The start month is after the end month' });
 
@@ -112,8 +111,8 @@ router.get('/ssn/:id', requirePermission('reports.view'), handler((req, res) => 
     months.push(cursor);
   }
 
-  const rows = months.map((month) => ssnMonth(ssn, month));
-  const sub = ssn.parent_id ? unitById(ssn.parent_id) : null;
+  const rows = await mapSeries(months, (month) => ssnMonth(ssn, month));
+  const sub = ssn.parent_id ? await unitById(ssn.parent_id) : null;
 
   noStore(res).json({
     basis: {
@@ -129,9 +128,9 @@ router.get('/ssn/:id', requirePermission('reports.view'), handler((req, res) => 
 
 /* ----------------------------------------------------------- rollup report -- */
 
-router.get('/rollup', requirePermission('reports.view'), handler((req, res) => {
-  const month = toMonth(req.query.month) || activeMonths({ limit: 1 })[0] || currentMonth();
-  const roll = mainMonth(month);
+router.get('/rollup', requirePermission('reports.view'), handler(async (req, res) => {
+  const month = toMonth(req.query.month) || (await activeMonths({ limit: 1 }))[0] || currentMonth();
+  const roll = await mainMonth(month);
 
   noStore(res).json({
     basis: {
@@ -139,21 +138,22 @@ router.get('/rollup', requirePermission('reports.view'), handler((req, res) => {
       note: 'Each SSN keeps its share; every sub-company passes on everything it collects.',
     },
     month,
-    months: activeMonths(),
+    months: await activeMonths(),
     rollup: roll,
   });
 }));
 
 /** Sub-company detail: its SSNs and what it collected. */
-router.get('/sub/:id', requirePermission('reports.view'), handler((req, res) => {
-  const unit = unitById(req.params.id);
+router.get('/sub/:id', requirePermission('reports.view'), handler(async (req, res) => {
+  const unit = await unitById(req.params.id);
   if (!unit || unit.kind !== 'sub') throw notFound('Sub-company not found');
-  const month = toMonth(req.query.month) || activeMonths({ limit: 1 })[0] || currentMonth();
+  const month = toMonth(req.query.month) || (await activeMonths({ limit: 1 }))[0] || currentMonth();
 
   const allow = inScope(req.actor);
-  const rows = ssnsUnder(unit.id)
-    .filter((d) => allow(d.id))
-    .map((d) => ssnMonth(d, month));
+  const rows = await mapSeries(
+    (await ssnsUnder(unit.id)).filter((d) => allow(d.id)),
+    (d) => ssnMonth(d, month)
+  );
 
   noStore(res).json({
     basis: { title: `${unit.name} — ${month}`, note: 'A sub-company keeps nothing; it passes on what it collects.' },
@@ -171,9 +171,9 @@ const FORMATS = ['csv', 'xlsx'];
 
 router.get('/export/month', requirePermission('reports.export'), handler(async (req, res) => {
   const format = check(req.query).enum('format', FORMATS, { label: 'Format' }).result().format ?? 'csv';
-  const month = toMonth(req.query.month) || activeMonths({ limit: 1 })[0] || currentMonth();
+  const month = toMonth(req.query.month) || (await activeMonths({ limit: 1 }))[0] || currentMonth();
   const allow = inScope(req.actor);
-  const rows = allSsnMonths(month).filter((r) => allow(r.ssn_id));
+  const rows = (await allSsnMonths(month)).filter((r) => allow(r.ssn_id));
 
   const meta = {
     title: `SSN results for ${month}`,
@@ -193,19 +193,19 @@ router.get('/export/month', requirePermission('reports.export'), handler(async (
 }));
 
 router.get('/export/ssn/:id', requirePermission('reports.export'), handler(async (req, res) => {
-  const ssn = unitById(req.params.id);
+  const ssn = await unitById(req.params.id);
   if (!ssn || ssn.kind !== 'ssn') throw notFound('SSN not found');
   if (!inScope(req.actor)(ssn.id)) throw notFound('SSN not found');
 
   const format = check(req.query).enum('format', FORMATS, { label: 'Format' }).result().format ?? 'csv';
-  const to = toMonth(req.query.month_to) || activeMonths({ limit: 1 })[0] || currentMonth();
+  const to = toMonth(req.query.month_to) || (await activeMonths({ limit: 1 }))[0] || currentMonth();
   const from = toMonth(req.query.month_from) || addMonths(to, -5);
 
   const months = [];
   for (let cursor = from; cursor <= to && months.length < 36; cursor = addMonths(cursor, 1)) {
     months.push(cursor);
   }
-  const rows = months.map((month) => ({ ...ssnMonth(ssn, month), sub_name: null }));
+  const rows = await mapSeries(months, async (month) => ({ ...(await ssnMonth(ssn, month)), sub_name: null }));
 
   const meta = {
     title: `${ssn.name} — ${from} to ${to}`,
@@ -249,7 +249,7 @@ const AUDIT_COLUMNS = [
 
 router.get('/audit-history', requirePermission('audit.view'), handler(async (req, res) => {
   const format = check(req.query).enum('format', FORMATS, { label: 'Format' }).result().format ?? 'csv';
-  const { rows } = listAudit({
+  const { rows } = await listAudit({
     entityType: req.query.entity_type,
     entityId: req.query.entity_id,
     action: req.query.action,
@@ -287,19 +287,19 @@ router.get('/audit-history', requirePermission('audit.view'), handler(async (req
  */
 router.get('/export/statement/:id', requirePermission('reports.export'),
   handler(async (req, res) => {
-    const ssn = unitById(req.params.id);
+    const ssn = await unitById(req.params.id);
     if (!ssn || ssn.kind !== 'ssn') throw notFound('SSN not found');
     if (!inScope(req.actor)(ssn.id)) throw notFound('SSN not found');
 
-    const month = toMonth(req.query.month) || activeMonths({ limit: 1 })[0] || currentMonth();
-    const statement = ssnMonth(ssn, month);
-    const sub = ssn.parent_id ? unitById(ssn.parent_id) : null;
-    const settings = loadSettings();
+    const month = toMonth(req.query.month) || (await activeMonths({ limit: 1 }))[0] || currentMonth();
+    const statement = await ssnMonth(ssn, month);
+    const sub = ssn.parent_id ? await unitById(ssn.parent_id) : null;
+    const settings = await loadSettings();
 
     const buffer = await statementPdf({
       statement: { ...statement, sub_name: sub?.name ?? null },
-      salaries: salaryLinesFor(ssn.id, month),
-      expenses: query(
+      salaries: await salaryLinesFor(ssn.id, month),
+      expenses: await query(
         `SELECT e.reference, e.expense_date, e.description, e.vendor, e.amount_cents,
                 c.name AS category_name
            FROM expenses e JOIN expense_categories c ON c.id = e.category_id

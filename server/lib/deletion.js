@@ -9,8 +9,8 @@ import { deletionAllowed } from '../services/settings.js';
  * decides whether anything may be destroyed at all. Checked on the server so
  * a hand-made request cannot get past a hidden button.
  */
-export function assertDeletionAllowed() {
-  if (!deletionAllowed()) {
+export async function assertDeletionAllowed() {
+  if (!(await deletionAllowed())) {
     throw forbidden('Deleting records is switched off. An owner can enable it in '
       + 'Settings under "Allow records to be deleted".');
   }

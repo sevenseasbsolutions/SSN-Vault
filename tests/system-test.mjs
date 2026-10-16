@@ -8,10 +8,12 @@
  * actually working end to end?
  *
  * It writes records and toggles the delete setting, so run it against a
- * throwaway database -- never a real one:
+ * throwaway schema in the test database -- never the real one:
  *
- *   DATABASE_PATH=/tmp/check.db OWNER_PASSWORD='a-long-passphrase' npm run seed
- *   DATABASE_PATH=/tmp/check.db PORT=4370 OWNER_PASSWORD='a-long-passphrase' npm start
+ *   export DATABASE_URL="$TEST_DATABASE_URL" DATABASE_SCHEMA=system_check
+ *   psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS system_check'
+ *   OWNER_PASSWORD='a-long-passphrase' npm run seed
+ *   PORT=4370 OWNER_PASSWORD='a-long-passphrase' npm start
  *   BASE=http://127.0.0.1:4370 OWNER_EMAIL=owner@example.com \
  *     OWNER_PASSWORD='a-long-passphrase' npm run test:system
  */

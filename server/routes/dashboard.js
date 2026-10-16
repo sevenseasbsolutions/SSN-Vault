@@ -34,10 +34,10 @@ const router = Router();
 router.use(requireAuth);
 
 /** A filter naming a unit must name one that exists, of the right kind, in scope. */
-function resolveUnit(req, param, kind) {
+async function resolveUnit(req, param, kind) {
   const raw = req.query[param];
   if (!raw) return null;
-  const unit = unitById(raw);
+  const unit = await unitById(raw);
   if (!unit || unit.kind !== kind) {
     throw validationError({
       [param]: `No ${kind === 'sub' ? 'sub-company' : 'SSN'} with that id`,
@@ -49,9 +49,9 @@ function resolveUnit(req, param, kind) {
   return unit;
 }
 
-router.get('/', requirePermission('dashboard.view'), handler((req, res) => {
-  const main = mainUnit();
-  const range = resolveRange(req);
+router.get('/', requirePermission('dashboard.view'), handler(async (req, res) => {
+  const main = await mainUnit();
+  const range = await resolveRange(req);
   const { from, to } = range;
 
   if (from > to) {
@@ -63,10 +63,10 @@ router.get('/', requirePermission('dashboard.view'), handler((req, res) => {
     throw validationError({ month_from: 'That range covers no months' });
   }
 
-  const sub = resolveUnit(req, 'sub_id', 'sub');
-  const ssn = resolveUnit(req, 'ssn_id', 'ssn');
+  const sub = await resolveUnit(req, 'sub_id', 'sub');
+  const ssn = await resolveUnit(req, 'ssn_id', 'ssn');
 
-  const { rollup, ssns, trend } = rangeSummary({
+  const { rollup, ssns, trend } = await rangeSummary({
     months,
     subId: sub?.id ?? null,
     ssnId: ssn?.id ?? null,
@@ -81,13 +81,13 @@ router.get('/', requirePermission('dashboard.view'), handler((req, res) => {
    * carry, and it is the breakdown a reader actually wants when they ask what
    * the expenses were, so it is fetched here rather than left to the client.
    */
-  const expenseCategories = (() => {
+  const expenseCategories = await (async () => {
     const ids = ssns.map((r) => r.ssn_id);
     if (!ids.length || !months.length) return [];
     const params = { status: 'approved' };
     ids.forEach((id, i) => { params[`s${i}`] = id; });
     months.forEach((m, i) => { params[`m${i}`] = m; });
-    return query(`
+    return (await query(`
       SELECT c.id AS category_id, c.name,
              COALESCE(SUM(e.amount_cents), 0) AS amount_cents,
              COUNT(*) AS count
@@ -97,8 +97,8 @@ router.get('/', requirePermission('dashboard.view'), handler((req, res) => {
          AND e.ssn_id IN (${ids.map((_, i) => `$s${i}`).join(',')})
          AND e.accounting_month IN (${months.map((_, i) => `$m${i}`).join(',')})
        GROUP BY c.id
-       ORDER BY amount_cents DESC
-    `, params).map((r) => ({
+       ORDER BY amount_cents DESC, c.id
+    `, params)).map((r) => ({
       category_id: Number(r.category_id),
       name: r.name,
       amount_cents: Number(r.amount_cents),
@@ -133,7 +133,7 @@ router.get('/', requirePermission('dashboard.view'), handler((req, res) => {
       ssn_id: ssn?.id ?? null,
       ssn_name: ssn?.name ?? null,
     },
-    months: activeMonths(),
+    months: await activeMonths(),
     main: main ? { id: main.id, name: main.name } : null,
     rollup,
     ssns,

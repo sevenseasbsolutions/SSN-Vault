@@ -1,9 +1,9 @@
 import { pathToFileURL } from 'node:url';
-import { query, queryOne, execute, transaction, getDb } from './connection.js';
+import { query, queryOne, execute, transaction, closeDb } from './connection.js';
 import { migrate } from './migrate.js';
 import { nowIso, monthKey, addMonths, currentMonth, toMonth } from '../lib/dates.js';
 import { hashPassword, randomToken } from '../auth/passwords.js';
-import { setSetting, invalidateSettings, DEFAULT_SETTINGS } from '../services/settings.js';
+import { setSetting, DEFAULT_SETTINGS } from '../services/settings.js';
 import { ssnMonth, mainMonth, mainUnit } from '../services/rollup.js';
 import { nextReference } from '../lib/reference.js';
 
@@ -28,22 +28,21 @@ const one = (sql, params = {}) => queryOne(sql, params);
  * decision an owner makes -- guessing it would mean every install starts by
  * deleting someone else's org chart.
  */
-export function ensureBaseline() {
+export async function ensureBaseline() {
   const now = nowIso();
   const result = { created: [], ownerEmail: null, ownerPassword: null };
 
-  transaction(() => {
+  await transaction(async () => {
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-      if (!one('SELECT key FROM settings WHERE key = $key', { key })) {
-        execute('INSERT INTO settings (key, value, updated_at) VALUES ($key, $value, $now)',
+      if (!(await one('SELECT key FROM settings WHERE key = $key', { key }))) {
+        await execute('INSERT INTO settings (key, value, updated_at) VALUES ($key, $value, $now)',
           { key, value, now });
       }
     }
-    invalidateSettings();
 
     for (const name of EXPENSE_CATEGORIES) {
-      if (!one('SELECT id FROM expense_categories WHERE lower(name) = lower($name)', { name })) {
-        execute(
+      if (!(await one('SELECT id FROM expense_categories WHERE lower(name) = lower($name)', { name }))) {
+        await execute(
           `INSERT INTO expense_categories (name, is_active, is_system, created_at, updated_at)
            VALUES ($name, 1, 1, $now, $now)`, { name, now }
         );
@@ -51,10 +50,10 @@ export function ensureBaseline() {
       }
     }
 
-    if (!one("SELECT id FROM users WHERE role = 'owner'")) {
+    if (!(await one("SELECT id FROM users WHERE role = 'owner'"))) {
       const email = String(process.env.OWNER_EMAIL ?? 'owner@example.com').toLowerCase();
       const password = process.env.OWNER_PASSWORD ?? `Vault-${randomToken(9)}`;
-      execute(
+      await execute(
         `INSERT INTO users (email, name, password_hash, role, is_active, must_change_pw, created_at, updated_at)
          VALUES ($email, $name, $hash, 'owner', 1, $must, $now, $now)`,
         {
@@ -89,44 +88,45 @@ const money = (dollars) => Math.round(dollars * 100);
  *
  * Idempotent on names, so running it twice adds nothing.
  */
-export function ensureStructure() {
+export async function ensureStructure() {
   const now = nowIso();
   const created = [];
 
-  const unit = (name, kind, parentId, { share = null, code = null, description = null } = {}) => {
-    const existing = one(
+  const unit = async (name, kind, parentId, { share = null, code = null, description = null } = {}) => {
+    const existing = await one(
       `SELECT * FROM org_units WHERE lower(name) = lower($name)
-         AND ((parent_id IS NULL AND $parent IS NULL) OR parent_id = $parent)`,
+         AND ((parent_id IS NULL AND $parent::bigint IS NULL) OR parent_id = $parent)`,
       { name, parent: parentId }
     );
     if (existing) return existing;
-    const result = execute(
+    const result = await execute(
       `INSERT INTO org_units
          (name, kind, parent_id, share_bps, code, description, is_active,
           created_at, updated_at)
-       VALUES ($name, $kind, $parent, $share, $code, $description, 1, $now, $now)`,
+       VALUES ($name, $kind, $parent, $share, $code, $description, 1, $now, $now)
+       RETURNING id`,
       { name, kind, parent: parentId, share, code, description, now }
     );
     created.push(`${kind}:${name}`);
     return one('SELECT * FROM org_units WHERE id = $id', { id: Number(result.lastInsertRowid) });
   };
 
-  return transaction(() => {
-    const mbs = unit('MBS', 'main', null, {
+  return transaction(async () => {
+    const mbs = await unit('MBS', 'main', null, {
       code: 'MBS', description: 'Main company. Receives everything the sub-companies collect.',
     });
-    const mbs1 = unit('MBS1', 'sub', mbs.id, {
+    const mbs1 = await unit('MBS1', 'sub', mbs.id, {
       code: 'MBS1', description: 'Sub-company. Collects from its SSNs and passes it all to MBS.',
     });
-    const mbs2 = unit('MBS2', 'sub', mbs.id, {
+    const mbs2 = await unit('MBS2', 'sub', mbs.id, {
       code: 'MBS2', description: 'Sub-company. Collects from its SSNs and passes it all to MBS.',
     });
 
     // share_bps is what the SSN KEEPS; the rest goes up the tree. There is no
     // tax rate here -- each job carries its own.
-    const alpha = unit('Alpha', 'ssn', mbs1.id, { share: 3000, code: 'ALPHA' });
-    const beta = unit('Beta', 'ssn', mbs1.id, { share: 4000, code: 'BETA' });
-    const gamma = unit('Gamma', 'ssn', mbs2.id, { share: 3500, code: 'GAMMA' });
+    const alpha = await unit('Alpha', 'ssn', mbs1.id, { share: 3000, code: 'ALPHA' });
+    const beta = await unit('Beta', 'ssn', mbs1.id, { share: 4000, code: 'BETA' });
+    const gamma = await unit('Gamma', 'ssn', mbs2.id, { share: 3500, code: 'GAMMA' });
 
     return { created, mbs, mbs1, mbs2, alpha, beta, gamma };
   });
@@ -161,33 +161,34 @@ export function ensureStructure() {
  * the month picker have something to show. Every record is flagged
  * is_demo = 1.
  */
-export function seedDemo({ force = false } = {}) {
-  const existing = one('SELECT id FROM jobs WHERE is_demo = 1 LIMIT 1');
+export async function seedDemo({ force = false } = {}) {
+  const existing = await one('SELECT id FROM jobs WHERE is_demo = 1 LIMIT 1');
   if (existing && !force) {
     return { skipped: true, message: 'Sample data is already present. Re-run with --force to replace it.' };
   }
-  if (existing && force) clearDemo();
+  if (existing && force) await clearDemo();
 
-  const structure = ensureStructure();
+  const structure = await ensureStructure();
   const now = nowIso();
   const thisMonth = currentMonth();
 
-  const category = (name) => one(
-    'SELECT id FROM expense_categories WHERE lower(name) = lower($name)', { name }).id;
-  const operating = category('Operating expenses');
-  const software = category('Software and subscriptions');
-  const contractor = category('Contractor or service costs');
+  const category = async (name) => (await one(
+    'SELECT id FROM expense_categories WHERE lower(name) = lower($name)', { name })).id;
+  const operating = await category('Operating expenses');
+  const software = await category('Software and subscriptions');
+  const contractor = await category('Contractor or service costs');
 
   /** A standing engagement. Holds the terms; holds no money. */
-  const addJob = (ssn, { title, client, taxCategory, holdBps, joined }) => {
-    const result = execute(
+  const addJob = async (ssn, { title, client, taxCategory, holdBps, joined }) => {
+    const result = await execute(
       `INSERT INTO jobs
          (reference, ssn_id, title, client_name, tax_category, tax_hold_bps, joining_date,
           is_active, is_demo, created_at, updated_at)
        VALUES ($reference, $ssn, $title, $client, $category, $hold, $joined,
-               1, 1, $now, $now)`,
+               1, 1, $now, $now)
+       RETURNING id`,
       {
-        reference: nextReference('jobs', 'JOB', toMonth(joined)),
+        reference: await nextReference('jobs', 'JOB', toMonth(joined)),
         ssn: ssn.id,
         title,
         client,
@@ -206,7 +207,7 @@ export function seedDemo({ force = false } = {}) {
    * `credited` defaults to the invoice, which is the ordinary 1099 case: the
    * full amount arrives and nothing is withheld.
    */
-  const addSalary = (jobId, month, { day, invoice, credited = invoice }) => {
+  const addSalary = async (jobId, month, { day, invoice, credited = invoice }) => {
     /*
      * A pay period running from the 21st of the previous month to the 20th of
      * this one: optional in the model, and set here because a period that
@@ -214,14 +215,14 @@ export function seedDemo({ force = false } = {}) {
      */
     const periodFrom = `${monthKey(addMonths(month, -1))}-21`;
     const periodTo = `${monthKey(month)}-20`;
-    execute(
+    await execute(
       `INSERT INTO salaries
          (reference, job_id, accounting_month, invoice_amount_cents, credited_amount_cents,
           credit_date, pay_period_from, pay_period_to, status, is_demo, created_at, updated_at)
        VALUES ($reference, $job, $month, $invoice, $credited, $date,
                $period_from, $period_to, 'active', 1, $now, $now)`,
       {
-        reference: nextReference('salaries', 'SAL', month),
+        reference: await nextReference('salaries', 'SAL', month),
         job: jobId,
         month,
         invoice: money(invoice),
@@ -234,15 +235,15 @@ export function seedDemo({ force = false } = {}) {
     );
   };
 
-  const addExpense = (ssn, month, { day, description, amount, categoryId, vendor }) => {
-    execute(
+  const addExpense = async (ssn, month, { day, description, amount, categoryId, vendor }) => {
+    await execute(
       `INSERT INTO expenses
          (reference, ssn_id, accounting_month, expense_date, amount_cents, category_id,
           description, vendor, status, is_demo, created_at, updated_at)
        VALUES ($reference, $ssn, $month, $date, $amount, $category, $description, $vendor,
                'approved', 1, $now, $now)`,
       {
-        reference: nextReference('expenses', 'EX', month),
+        reference: await nextReference('expenses', 'EX', month),
         ssn: ssn.id,
         month,
         date: `${monthKey(month)}-${String(day).padStart(2, '0')}`,
@@ -255,7 +256,7 @@ export function seedDemo({ force = false } = {}) {
     );
   };
 
-  return transaction(() => {
+  return transaction(async () => {
     const { alpha, beta, gamma } = structure;
     // The engagements all started six months ago, so every generated month
     // falls after their joining date.
@@ -264,29 +265,29 @@ export function seedDemo({ force = false } = {}) {
     /* ----------------------------------------------- the standing jobs -- */
     const jobs = {
       // Alpha. The first is the worked example: 1,000 invoiced, 800 credited.
-      alphaW2: addJob(alpha, {
+      alphaW2: await addJob(alpha, {
         title: 'Website rebuild', client: 'Harbour Logistics',
         taxCategory: 'w2', holdBps: 1000, joined: started,
       }),
-      alpha1099: addJob(alpha, {
+      alpha1099: await addJob(alpha, {
         title: 'Mobile app phase 1', client: 'Northwind Retail',
         taxCategory: '1099', holdBps: 1000, joined: started,
       }),
-      alphaW2b: addJob(alpha, {
+      alphaW2b: await addJob(alpha, {
         title: 'Analytics dashboard', client: 'Cedar Health',
         taxCategory: 'w2', holdBps: 1000, joined: started,
       }),
 
-      beta1099: addJob(beta, {
+      beta1099: await addJob(beta, {
         title: 'Brand refresh', client: 'Lumen Foods',
         taxCategory: '1099', holdBps: 1200, joined: started,
       }),
-      betaW2: addJob(beta, {
+      betaW2: await addJob(beta, {
         title: 'Campaign retainer', client: 'Vertex Media',
         taxCategory: 'w2', holdBps: 1200, joined: started,
       }),
 
-      gammaW2: addJob(gamma, {
+      gammaW2: await addJob(gamma, {
         title: 'Data migration', client: 'Fairline Group',
         taxCategory: 'w2', holdBps: 1500, joined: started,
       }),
@@ -294,29 +295,29 @@ export function seedDemo({ force = false } = {}) {
 
     /* --------------------------------- the worked example, this month -- */
     // 1,000 invoiced, 800 credited: 200 withheld, 80 held at 10%, 720 to Alpha.
-    addSalary(jobs.alphaW2, thisMonth, { day: 4, invoice: 1000, credited: 800 });
-    addSalary(jobs.alpha1099, thisMonth, { day: 11, invoice: 5000 });
-    addSalary(jobs.alphaW2b, thisMonth, { day: 19, invoice: 4000, credited: 3200 });
+    await addSalary(jobs.alphaW2, thisMonth, { day: 4, invoice: 1000, credited: 800 });
+    await addSalary(jobs.alpha1099, thisMonth, { day: 11, invoice: 5000 });
+    await addSalary(jobs.alphaW2b, thisMonth, { day: 19, invoice: 4000, credited: 3200 });
 
-    addExpense(alpha, thisMonth, {
+    await addExpense(alpha, thisMonth, {
       day: 6, description: 'Contract designer', amount: 1800, categoryId: contractor, vendor: 'Studio Kite',
     });
-    addExpense(alpha, thisMonth, {
+    await addExpense(alpha, thisMonth, {
       day: 12, description: 'Team tooling and licences', amount: 700, categoryId: software, vendor: 'Atlassian',
     });
-    addExpense(alpha, thisMonth, {
+    await addExpense(alpha, thisMonth, {
       day: 22, description: 'Office and utilities share', amount: 500, categoryId: operating, vendor: 'Regus',
     });
 
     /* ------------------------------------- the other SSNs, for shape -- */
-    addSalary(jobs.beta1099, thisMonth, { day: 7, invoice: 4000 });
-    addSalary(jobs.betaW2, thisMonth, { day: 21, invoice: 3000, credited: 2400 });
-    addExpense(beta, thisMonth, {
+    await addSalary(jobs.beta1099, thisMonth, { day: 7, invoice: 4000 });
+    await addSalary(jobs.betaW2, thisMonth, { day: 21, invoice: 3000, credited: 2400 });
+    await addExpense(beta, thisMonth, {
       day: 9, description: 'Freelance copywriting', amount: 1200, categoryId: contractor, vendor: 'J. Okafor',
     });
 
-    addSalary(jobs.gammaW2, thisMonth, { day: 5, invoice: 7000, credited: 6000 });
-    addExpense(gamma, thisMonth, {
+    await addSalary(jobs.gammaW2, thisMonth, { day: 5, invoice: 7000, credited: 6000 });
+    await addExpense(gamma, thisMonth, {
       day: 14, description: 'Cloud hosting', amount: 900, categoryId: software, vendor: 'AWS',
     });
 
@@ -334,35 +335,35 @@ export function seedDemo({ force = false } = {}) {
     ];
     const w2 = (invoice) => ({ invoice, credited: Math.round(invoice * 0.8) });
 
-    pattern.forEach((row, index) => {
+    for (const [index, row] of pattern.entries()) {
       const month = addMonths(thisMonth, -(pattern.length - index));
 
-      addSalary(jobs.alphaW2, month, { day: 5, ...w2(row.alpha[0]) });
-      addSalary(jobs.alpha1099, month, { day: 13, invoice: row.alpha[1] });
-      addSalary(jobs.alphaW2b, month, { day: 21, ...w2(row.alpha[2]) });
-      addExpense(alpha, month, {
+      await addSalary(jobs.alphaW2, month, { day: 5, ...w2(row.alpha[0]) });
+      await addSalary(jobs.alpha1099, month, { day: 13, invoice: row.alpha[1] });
+      await addSalary(jobs.alphaW2b, month, { day: 21, ...w2(row.alpha[2]) });
+      await addExpense(alpha, month, {
         day: 24, description: 'Monthly running costs', amount: row.alphaCost,
         categoryId: operating, vendor: 'Various',
       });
 
-      addSalary(jobs.beta1099, month, { day: 6, invoice: row.beta[0] });
-      addSalary(jobs.betaW2, month, { day: 15, ...w2(row.beta[1]) });
-      addExpense(beta, month, {
+      await addSalary(jobs.beta1099, month, { day: 6, invoice: row.beta[0] });
+      await addSalary(jobs.betaW2, month, { day: 15, ...w2(row.beta[1]) });
+      await addExpense(beta, month, {
         day: 25, description: 'Monthly running costs', amount: row.betaCost,
         categoryId: operating, vendor: 'Various',
       });
 
-      addSalary(jobs.gammaW2, month, { day: 8, ...w2(row.gamma[0]) });
-      addExpense(gamma, month, {
+      await addSalary(jobs.gammaW2, month, { day: 8, ...w2(row.gamma[0]) });
+      await addExpense(gamma, month, {
         day: 26, description: 'Monthly running costs', amount: row.gammaCost,
         categoryId: operating, vendor: 'Various',
       });
-    });
+    }
 
-    setSetting('demo_mode', 'true', null);
+    await setSetting('demo_mode', 'true', null);
 
-    const alphaStatement = ssnMonth(alpha, thisMonth);
-    const roll = mainMonth(thisMonth);
+    const alphaStatement = await ssnMonth(alpha, thisMonth);
+    const roll = await mainMonth(thisMonth);
     return {
       skipped: false,
       structure_created: structure.created,
@@ -379,34 +380,33 @@ export function seedDemo({ force = false } = {}) {
  * user entered themselves untouched.
  */
 export function clearDemo() {
-  return transaction(() => {
-    const salaries = query('SELECT id FROM salaries WHERE is_demo = 1').map((r) => r.id);
-    const jobs = query('SELECT id FROM jobs WHERE is_demo = 1').map((r) => r.id);
-    const expenses = query('SELECT id FROM expenses WHERE is_demo = 1').map((r) => r.id);
+  return transaction(async () => {
+    const salaries = await query('SELECT id FROM salaries WHERE is_demo = 1');
+    const jobs = await query('SELECT id FROM jobs WHERE is_demo = 1');
+    const expenses = await query('SELECT id FROM expenses WHERE is_demo = 1');
     // Salaries first: they point at the jobs.
-    execute('DELETE FROM salaries WHERE is_demo = 1');
-    execute('DELETE FROM jobs WHERE is_demo = 1');
-    execute('DELETE FROM expenses WHERE is_demo = 1');
-    setSetting('demo_mode', 'false', null);
+    await execute('DELETE FROM salaries WHERE is_demo = 1');
+    await execute('DELETE FROM jobs WHERE is_demo = 1');
+    await execute('DELETE FROM expenses WHERE is_demo = 1');
+    await setSetting('demo_mode', 'false', null);
     return { salaries: salaries.length, jobs: jobs.length, expenses: expenses.length };
   });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  getDb();
-  migrate({ silent: true });
-  const baseline = ensureBaseline();
+  await migrate({ silent: true });
+  const baseline = await ensureBaseline();
   if (baseline.ownerPassword) {
     console.log(`Owner account created: ${baseline.ownerEmail} / ${baseline.ownerPassword}`);
   }
 
   if (process.argv.includes('--clear')) {
-    console.log('Clearing sample data...', clearDemo());
-    console.log(`Company structure kept: ${mainUnit()?.name ?? 'none'}`);
+    console.log('Clearing sample data...', await clearDemo());
+    console.log(`Company structure kept: ${(await mainUnit())?.name ?? 'none'}`);
   } else if (process.argv.includes('--structure-only')) {
-    console.log('Company structure:', ensureStructure().created);
+    console.log('Company structure:', (await ensureStructure()).created);
   } else {
-    const result = seedDemo({ force: process.argv.includes('--force') });
+    const result = await seedDemo({ force: process.argv.includes('--force') });
     if (result.skipped) console.log(result.message);
     else {
       const d = (cents) => `$${(cents / 100).toFixed(2)}`;
@@ -423,4 +423,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       console.log(`  MBS received    ${d(result.received_by_mbs_cents)} (all SSNs)`);
     }
   }
+  await closeDb();
 }

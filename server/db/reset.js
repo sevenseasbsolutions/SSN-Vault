@@ -1,23 +1,19 @@
-import fs from 'node:fs';
 import readline from 'node:readline/promises';
-import { resolveDbPath, closeDb } from './connection.js';
+import { query, exec, transaction, closeDb, describeDatabase } from './connection.js';
 
 /**
- * Destructive: deletes the database file. Requires an explicit confirmation,
- * or --yes for scripted use. Back up data/vault.db first if it matters.
+ * Destructive: drops every table in the application's schema. Requires an
+ * explicit confirmation, or --yes for scripted use. Back the database up first
+ * (pg_dump) if it matters.
  */
-const target = resolveDbPath();
-
-if (target === ':memory:') {
-  console.log('DATABASE_PATH is :memory: — nothing to delete.');
-  process.exit(0);
-}
+const target = describeDatabase();
 
 const confirmed = process.argv.includes('--yes');
 if (!confirmed) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const answer = await rl.question(
-    `This permanently deletes ${target} and every financial record in it.\nType DELETE to confirm: `
+    `This permanently drops every table in ${target} and every financial record in them.\n`
+    + 'Type DELETE to confirm: '
   );
   rl.close();
   if (answer.trim() !== 'DELETE') {
@@ -26,9 +22,16 @@ if (!confirmed) {
   }
 }
 
-closeDb();
-for (const suffix of ['', '-wal', '-shm']) {
-  const file = `${target}${suffix}`;
-  if (fs.existsSync(file)) { fs.rmSync(file); console.log(`Deleted ${file}`); }
-}
-console.log('Done. Run "npm start" to recreate the database.');
+const dropped = await transaction(async () => {
+  const tables = (await query(
+    'SELECT tablename FROM pg_tables WHERE schemaname = current_schema() ORDER BY tablename'
+  )).map((r) => r.tablename);
+  if (tables.length) {
+    await exec(`DROP TABLE ${tables.map((t) => `"${t.replace(/"/g, '""')}"`).join(', ')} CASCADE`);
+  }
+  return tables;
+});
+await closeDb();
+
+for (const table of dropped) console.log(`Dropped ${table}`);
+console.log('Done. Run "npm start" to recreate the schema.');
